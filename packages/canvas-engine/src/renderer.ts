@@ -2,6 +2,7 @@ import type { CanvasElement } from "./elements.js";
 import { Camera } from "./camera.js";
 import { Scene } from "./scene.js";
 import { ImageResources } from "./resources.js";
+import { traceFreehand } from "./tools.js";
 
 export class CanvasRenderer {
   private sceneCanvas = document.createElement("canvas");
@@ -140,6 +141,8 @@ export class CanvasRenderer {
         this.paint(ctx, e);
         break;
       case "freehand":
+        traceFreehand(ctx, e.points, e.strokeWidth ?? 1);
+        break;
       case "eraser":
         if (e.points.length) {
           ctx.beginPath();

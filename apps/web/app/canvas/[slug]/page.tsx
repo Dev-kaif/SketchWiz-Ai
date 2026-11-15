@@ -34,6 +34,7 @@ type DrawingMode =
   | "freehand"
   | "text"
   | "eraser"
+  | "precision-eraser"
   | "arrow"
   | "select"
   | null;
@@ -341,7 +342,10 @@ const Page = ({ params }: Param) => {
   // Update the eraser cursor position.
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
-      if (mode === "eraser" && eraserCursorRef.current) {
+      if (
+        (mode === "eraser" || mode === "precision-eraser") &&
+        eraserCursorRef.current
+      ) {
         eraserCursorRef.current.style.left = `${e.clientX - eraserSize / 2}px`;
         eraserCursorRef.current.style.top = `${e.clientY - eraserSize / 2}px`;
         eraserCursorRef.current.style.display = "block";
@@ -352,6 +356,19 @@ const Page = ({ params }: Param) => {
     window.addEventListener("mousemove", handleMouseMove);
     return () => window.removeEventListener("mousemove", handleMouseMove);
   }, [mode, eraserSize]);
+
+  useEffect(() => {
+    const onPersistenceError = (event: Event) => {
+      const detail = (event as CustomEvent<string>).detail;
+      addNotification("error", detail || "Canvas change was not saved.");
+    };
+    window.addEventListener("canvas:persistence-error", onPersistenceError);
+    return () =>
+      window.removeEventListener(
+        "canvas:persistence-error",
+        onPersistenceError,
+      );
+  }, [addNotification]);
 
   if (!dimensions) return null;
 
@@ -453,7 +470,7 @@ const Page = ({ params }: Param) => {
               className="w-full"
             />
           </div>
-          {mode !== "eraser" && (
+          {mode !== "eraser" && mode !== "precision-eraser" && (
             <div>
               <div className="mb-4">
                 <label htmlFor="strokeColor" className="block text-sm mb-1">
@@ -524,9 +541,24 @@ const Page = ({ params }: Param) => {
           { name: "freehand", symbol: <Pencil /> },
           { name: "text", symbol: <TypeOutline /> },
           { name: "eraser", symbol: <Eraser /> },
+          { name: "precision-eraser", symbol: <Eraser /> },
         ].map((shapeObj) => (
           <button
             key={shapeObj.name}
+            title={
+              shapeObj.name === "eraser"
+                ? "Erase whole objects"
+                : shapeObj.name === "precision-eraser"
+                  ? "Erase part of freehand strokes"
+                  : shapeObj.name
+            }
+            aria-label={
+              shapeObj.name === "eraser"
+                ? "Erase whole objects"
+                : shapeObj.name === "precision-eraser"
+                  ? "Erase part of freehand strokes"
+                  : shapeObj.name
+            }
             onClick={() => {
               setShowSettings(true);
               setMode(shapeObj.name as DrawingMode);

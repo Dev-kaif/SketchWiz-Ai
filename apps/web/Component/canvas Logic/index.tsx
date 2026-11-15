@@ -2,9 +2,20 @@
 /* eslint-disable no-case-declarations */
 import axios from "../axios/index";
 import { BACKEND_URL } from "../Config";
-import { Camera, CanvasRenderer, Scene, type CanvasElement } from "@repo/canvas-engine";
+import {
+  Camera,
+  CanvasRenderer,
+  FreehandBuilder,
+  PointerToolLifecycle,
+  Scene,
+  splitFreehand,
+  sweptIntersects,
+  traceFreehand,
+  type CanvasElement,
+  type ToolPoint,
+} from "@repo/canvas-engine";
 
-type Point = { x: number; y: number };
+type Point = { x: number; y: number; pressure?: number };
 
 export type Shape =
   | {
@@ -144,6 +155,7 @@ export default async function initDraw(
     | "freehand"
     | "text"
     | "eraser"
+    | "precision-eraser"
     | "arrow"
     | "select"
     | null
@@ -152,7 +164,7 @@ export default async function initDraw(
   strokeWidthRef: React.RefObject<number>,
   socket: WebSocket,
   params: Promise<{ slug: string }>,
-  setAiResponse: (a: string) => void
+  setAiResponse: (a: string) => void,
 ): Promise<InitDrawControls> {
   const defaultState: DrawState = {
     shapes: [],
@@ -192,7 +204,7 @@ export default async function initDraw(
       getSelectedShapesInfo: () => [],
       deleteShapeById: () => {},
       clearLocally: () => {},
-      captureSelectedAreaBlob: () => Promise.resolve(null)
+      captureSelectedAreaBlob: () => Promise.resolve(null),
     };
   }
 
@@ -209,6 +221,9 @@ export default async function initDraw(
   let roomIdForSync: number | null = null;
   let canvasRevision = 0;
   let requestedSyncRevision: number | null = null;
+  let pointerToolActive = false;
+  let activePointerTool: "freehand" | "eraser" | "precision-eraser" | null =
+    null;
 
   // Schedule rendering with requestAnimationFrame.
   let renderRequested = false;
@@ -247,7 +262,7 @@ export default async function initDraw(
 
   function getShapeBounds(
     ctx: CanvasRenderingContext2D,
-    shape: Shape
+    shape: Shape,
   ): { x: number; y: number; width: number; height: number } | null {
     // Note: Text and Freehand bounds are approximations.
     // For precise text bounds, you might need to render to a temp canvas and measure.
@@ -369,65 +384,70 @@ export default async function initDraw(
       renderer.invalidateScene();
       // If the deleted shape was selected, clear selection or adjust index
       state.selectedShapeIds = state.selectedShapeIds.filter(
-        (selectedId) => selectedId !== id
+        (selectedId) => selectedId !== id,
       );
       scheduleRender();
       if (roomIdForSync !== null && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({
-          type: "canvas:delete",
-          roomId: roomIdForSync,
-          operationId: crypto.randomUUID(),
-          elementId: id,
-        }));
+        socket.send(
+          JSON.stringify({
+            type: "canvas:delete",
+            roomId: roomIdForSync,
+            operationId: crypto.randomUUID(),
+            elementId: id,
+          }),
+        );
       }
     }
   }
 
-
   // Add this function inside initDraw, near getSelectedShapesInfo
-function captureSelectedAreaBlob(): Promise<Blob | null> {
-  return new Promise(resolve => {
+  function captureSelectedAreaBlob(): Promise<Blob | null> {
+    return new Promise((resolve) => {
       if (!ctx || state.selectedShapeIds.length === 0) {
-          resolve(null);
-          return;
+        resolve(null);
+        return;
       }
 
       // 1. Calculate combined bounding box of all selected shapes
-      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      let minX = Infinity,
+        minY = Infinity,
+        maxX = -Infinity,
+        maxY = -Infinity;
       const selectedShapes: Shape[] = [];
 
-      state.selectedShapeIds.forEach(id => {
-          const shape = state.shapes.find(s => s.id === id);
-          if (shape) {
-              const bounds = getShapeBounds(ctx, shape);
-              if (bounds) {
-                  minX = Math.min(minX, bounds.x);
-                  minY = Math.min(minY, bounds.y);
-                  maxX = Math.max(maxX, bounds.x + bounds.width);
-                  maxY = Math.max(maxY, bounds.y + bounds.height);
-                  selectedShapes.push(shape); // Collect selected shapes for drawing
-              }
+      state.selectedShapeIds.forEach((id) => {
+        const shape = state.shapes.find((s) => s.id === id);
+        if (shape) {
+          const bounds = getShapeBounds(ctx, shape);
+          if (bounds) {
+            minX = Math.min(minX, bounds.x);
+            minY = Math.min(minY, bounds.y);
+            maxX = Math.max(maxX, bounds.x + bounds.width);
+            maxY = Math.max(maxY, bounds.y + bounds.height);
+            selectedShapes.push(shape); // Collect selected shapes for drawing
           }
+        }
       });
 
-      if (selectedShapes.length === 0) { // No valid selected shapes found
-          resolve(null);
-          return;
+      if (selectedShapes.length === 0) {
+        // No valid selected shapes found
+        resolve(null);
+        return;
       }
 
       const combinedBounds = {
-          x: minX,
-          y: minY,
-          width: maxX - minX,
-          height: maxY - minY,
+        x: minX,
+        y: minY,
+        width: maxX - minX,
+        height: maxY - minY,
       };
 
-      const tempCanvas = document.createElement('canvas');
-      const tempCtx = tempCanvas.getContext('2d');
+      const tempCanvas = document.createElement("canvas");
+      const tempCtx = tempCanvas.getContext("2d");
 
       if (!tempCtx) {
-          resolve(null);
-          return;
+        resolve(null);
+        return;
       }
 
       const padding = 10; // Add some padding around the captured area
@@ -439,30 +459,33 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
 
       // Translate the temporary context so that the combinedBounds's top-left
       // corner is at (padding, padding) on the tempCanvas.
-      tempCtx.translate(-combinedBounds.x + padding, -combinedBounds.y + padding);
+      tempCtx.translate(
+        -combinedBounds.x + padding,
+        -combinedBounds.y + padding,
+      );
 
       // 2. Draw ONLY the selected shapes onto the temporary canvas
-      selectedShapes.forEach(shape => {
-          const drawFn = (drawShape as any)[shape.type];
-          if (drawFn) {
-              // Ensure temporary canvas uses the same scaling logic if any within drawShape
-              tempCtx.save();
-              tempCtx.lineJoin = "round";
-              tempCtx.lineCap = "round";
-              tempCtx.shadowBlur = 0;
-              drawFn(tempCtx, shape);
-              tempCtx.restore();
-          }
+      selectedShapes.forEach((shape) => {
+        const drawFn = (drawShape as any)[shape.type];
+        if (drawFn) {
+          // Ensure temporary canvas uses the same scaling logic if any within drawShape
+          tempCtx.save();
+          tempCtx.lineJoin = "round";
+          tempCtx.lineCap = "round";
+          tempCtx.shadowBlur = 0;
+          drawFn(tempCtx, shape);
+          tempCtx.restore();
+        }
       });
 
       tempCtx.restore();
 
-      tempCanvas.toBlob(blob => {
-          resolve(blob);
-          tempCanvas.remove(); // Clean up temp canvas
-      }, 'image/png');
-  });
-}
+      tempCanvas.toBlob((blob) => {
+        resolve(blob);
+        tempCanvas.remove(); // Clean up temp canvas
+      }, "image/png");
+    });
+  }
 
   // --------------------------------------------------
   // Drawing Helper Functions for Permanent Shapes
@@ -470,7 +493,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
   const drawShape = {
     rectangle: (
       ctx: CanvasRenderingContext2D,
-      shape: Extract<Shape, { type: "rectangle" }>
+      shape: Extract<Shape, { type: "rectangle" }>,
     ) => {
       ctx.shadowColor = shape.strokeColor;
       ctx.strokeStyle = shape.strokeColor;
@@ -479,7 +502,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     },
     circle: (
       ctx: CanvasRenderingContext2D,
-      shape: Extract<Shape, { type: "circle" }>
+      shape: Extract<Shape, { type: "circle" }>,
     ) => {
       ctx.shadowColor = shape.strokeColor;
       ctx.strokeStyle = shape.strokeColor;
@@ -492,13 +515,13 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
         shape.radiusY,
         0,
         0,
-        Math.PI * 2
+        Math.PI * 2,
       );
       ctx.stroke();
     },
     line: (
       ctx: CanvasRenderingContext2D,
-      shape: Extract<Shape, { type: "line" }>
+      shape: Extract<Shape, { type: "line" }>,
     ) => {
       ctx.shadowColor = shape.strokeColor;
       ctx.strokeStyle = shape.strokeColor;
@@ -510,7 +533,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     },
     triangle: (
       ctx: CanvasRenderingContext2D,
-      shape: Extract<Shape, { type: "triangle" }>
+      shape: Extract<Shape, { type: "triangle" }>,
     ) => {
       ctx.shadowColor = shape.strokeColor;
       ctx.strokeStyle = shape.strokeColor;
@@ -524,23 +547,15 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     },
     freehand: (
       ctx: CanvasRenderingContext2D,
-      shape: Extract<Shape, { type: "freehand" }>
+      shape: Extract<Shape, { type: "freehand" }>,
     ) => {
-      ctx.shadowColor = shape.strokeColor;
       ctx.strokeStyle = shape.strokeColor;
-      ctx.lineWidth = shape.strokeWidth;
-      ctx.beginPath();
-      // ADDED: Nullish coalescing for safety if points array is unexpectedly empty
-      ctx.moveTo(shape.points[0]?.x ?? 0, shape.points[0]?.y ?? 0);
-      shape.points.forEach((p, i) => {
-        if (i > 0) ctx.lineTo(p.x, p.y);
-      });
-      ctx.stroke();
+      traceFreehand(ctx, shape.points, shape.strokeWidth);
     },
     // For text, split on "\n" and draw each line.
     text: (
       ctx: CanvasRenderingContext2D,
-      shape: Extract<Shape, { type: "text" }>
+      shape: Extract<Shape, { type: "text" }>,
     ) => {
       const lines = shape.content.split("\n");
       const fontSize = shape.strokeWidth * 10;
@@ -552,7 +567,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     },
     eraser: (
       ctx: CanvasRenderingContext2D,
-      shape: Extract<Shape, { type: "eraser" }>
+      shape: Extract<Shape, { type: "eraser" }>,
     ) => {
       ctx.save();
       ctx.globalCompositeOperation = "destination-out";
@@ -570,7 +585,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     },
     arrow: (
       ctx: CanvasRenderingContext2D,
-      shape: Extract<Shape, { type: "arrow" }>
+      shape: Extract<Shape, { type: "arrow" }>,
     ) => {
       ctx.shadowColor = shape.strokeColor;
       ctx.strokeStyle = shape.strokeColor;
@@ -588,11 +603,11 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
       ctx.moveTo(shape.x2, shape.y2);
       ctx.lineTo(
         shape.x2 - headLength * Math.cos(angle - Math.PI / 7),
-        shape.y2 - headLength * Math.sin(angle - Math.PI / 7)
+        shape.y2 - headLength * Math.sin(angle - Math.PI / 7),
       );
       ctx.lineTo(
         shape.x2 - headLength * Math.cos(angle + Math.PI / 7),
-        shape.y2 - headLength * Math.sin(angle + Math.PI / 7)
+        shape.y2 - headLength * Math.sin(angle + Math.PI / 7),
       );
       ctx.closePath();
       ctx.fillStyle = shape.strokeColor;
@@ -600,7 +615,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     },
     image: (
       ctx: CanvasRenderingContext2D,
-      shape: Extract<Shape, { type: "image" }>
+      shape: Extract<Shape, { type: "image" }>,
     ) => {
       let img = imageCache.get(shape.src);
       if (!img) {
@@ -616,7 +631,8 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
         };
         img.src = shape.src;
         imageCache.set(shape.src, img);
-        if (imageCache.size > 128) imageCache.delete(imageCache.keys().next().value!);
+        if (imageCache.size > 128)
+          imageCache.delete(imageCache.keys().next().value!);
       }
 
       // Draw only if the image is loaded and ready
@@ -634,7 +650,11 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     camera.x = state.offsetX;
     camera.y = state.offsetY;
     camera.zoom = state.scale;
-    if (camera.x !== renderedCamera.x || camera.y !== renderedCamera.y || camera.zoom !== renderedCamera.zoom) {
+    if (
+      camera.x !== renderedCamera.x ||
+      camera.y !== renderedCamera.y ||
+      camera.zoom !== renderedCamera.zoom
+    ) {
       renderer.invalidateScene();
       renderedCamera = { x: camera.x, y: camera.y, zoom: camera.zoom };
     }
@@ -715,37 +735,26 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     // 3. Preview for freehand pencil.
     if (state.isFreehandDrawing && state.freehandPoints.length > 0) {
       ctx.save();
-      ctx.lineJoin = "round";
-      ctx.lineCap = "round";
-      ctx.shadowColor = strokeColorRef.current;
       ctx.strokeStyle = strokeColorRef.current;
-      ctx.lineWidth = strokeWidthRef.current;
-      ctx.beginPath();
-      // ADDED: Nullish coalescing for safety if points array is unexpectedly empty
-      ctx.moveTo(
-        state.freehandPoints[0]?.x ?? 0,
-        state.freehandPoints[0]?.y ?? 0
-      );
-      state.freehandPoints.forEach((pt, i) => {
-        if (i > 0) ctx.lineTo(pt.x, pt.y);
-      });
-      ctx.stroke();
+      traceFreehand(ctx, state.freehandPoints, strokeWidthRef.current);
       ctx.restore();
     }
 
     // 4. Preview for eraser.
     if (state.isErasing && state.eraserPoints.length > 0) {
       ctx.save();
-      ctx.globalCompositeOperation = "destination-out";
-      ctx.lineJoin = "round";
-      ctx.lineCap = "round";
-      ctx.lineWidth = strokeWidthRef.current * 10;
+      ctx.globalCompositeOperation = "source-over";
+      ctx.strokeStyle = "rgba(255,255,255,.8)";
+      ctx.lineWidth = 1 / state.scale;
       ctx.beginPath();
-      // ADDED: Nullish coalescing for safety if points array is unexpectedly empty
-      ctx.moveTo(state.eraserPoints[0]?.x ?? 0, state.eraserPoints[0]?.y ?? 0);
-      state.eraserPoints.forEach((pt, i) => {
-        if (i > 0) ctx.lineTo(pt.x, pt.y);
-      });
+      const last = state.eraserPoints.at(-1)!;
+      ctx.arc(
+        last.x,
+        last.y,
+        (strokeWidthRef.current * 5) / state.scale,
+        0,
+        Math.PI * 2,
+      );
       ctx.stroke();
       ctx.restore();
     }
@@ -764,7 +773,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
         ctx.fillText(
           lines[i] as string,
           state.textPreview.x,
-          state.textPreview.y + i * fontSize * 1.2
+          state.textPreview.y + i * fontSize * 1.2,
         );
       }
       ctx.restore();
@@ -787,11 +796,13 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     if (roomIdForSync === null || socket.readyState !== WebSocket.OPEN) return;
     if (requestedSyncRevision === canvasRevision) return;
     requestedSyncRevision = canvasRevision;
-    socket.send(JSON.stringify({
-      type: "canvas:sync",
-      roomId: roomIdForSync,
-      afterRevision: canvasRevision,
-    }));
+    socket.send(
+      JSON.stringify({
+        type: "canvas:sync",
+        roomId: roomIdForSync,
+        afterRevision: canvasRevision,
+      }),
+    );
   }
 
   function applyRevisionedOperation(operation: any) {
@@ -807,7 +818,11 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
       state.shapes = [];
       scene.clear();
       renderer.invalidateScene();
-    } else if (["canvas:delete", "canvas:delete_element", "delete_element"].includes(type)) {
+    } else if (
+      ["canvas:delete", "canvas:delete_element", "delete_element"].includes(
+        type,
+      )
+    ) {
       const id = operation.elementId ?? payload?.id;
       if (typeof id === "string")
         state.shapes = state.shapes.filter((shape) => shape.id !== id);
@@ -817,7 +832,11 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
       }
     } else {
       const element = operation.element ?? payload?.element ?? payload;
-      if (element && typeof element.id === "string" && typeof element.type === "string")
+      if (
+        element &&
+        typeof element.id === "string" &&
+        typeof element.type === "string"
+      )
         upsertShape(element as Shape);
     }
     canvasRevision = revision;
@@ -826,6 +845,12 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
 
   function applyServerMessage(data: any) {
     if (data.type === "canvas:ack") {
+      if (data.error)
+        window.dispatchEvent(
+          new CustomEvent("canvas:persistence-error", {
+            detail: "A canvas change was rejected; syncing saved state",
+          }),
+        );
       // The acknowledgement confirms durability, but another client's operation
       // may precede this revision. Recover from our last applied revision.
       requestCanvasSync();
@@ -834,7 +859,9 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     if (data.type === "canvas:sync" && data.mode) {
       requestedSyncRevision = null;
       if (data.mode === "snapshot") {
-        state.shapes = Array.isArray(data.elements) ? data.elements as Shape[] : [];
+        state.shapes = Array.isArray(data.elements)
+          ? (data.elements as Shape[])
+          : [];
         scene.clear();
         renderer.invalidateScene();
         for (const shape of state.shapes) setSceneElement(shape);
@@ -847,13 +874,24 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
       return;
     }
     if (data.type === "canvas:batch" && Array.isArray(data.operations)) {
-      data.operations.forEach((operation: any) => applyRevisionedOperation({
-        ...operation,
-        type: `canvas:${operation.kind}`,
-      }));
+      data.operations.forEach((operation: any) =>
+        applyRevisionedOperation({
+          ...operation,
+          type: `canvas:${operation.kind}`,
+        }),
+      );
       return;
     }
-    if (["canvas:create", "canvas:update", "canvas:delete", "canvas:create_element", "canvas:update_element", "canvas:delete_element"].includes(data.type)) {
+    if (
+      [
+        "canvas:create",
+        "canvas:update",
+        "canvas:delete",
+        "canvas:create_element",
+        "canvas:update_element",
+        "canvas:delete_element",
+      ].includes(data.type)
+    ) {
       applyRevisionedOperation(data);
       return;
     }
@@ -878,7 +916,9 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     const roomId = roomIdRes.data.room.id;
     roomIdForSync = roomId;
     const res = await axios.get(`${BACKEND_URL}/api/room/${roomId}/canvas`);
-    state.shapes = Array.isArray(res.data.elements) ? res.data.elements as Shape[] : [];
+    state.shapes = Array.isArray(res.data.elements)
+      ? (res.data.elements as Shape[])
+      : [];
     scene.clear();
     renderer.invalidateScene();
     for (const shape of state.shapes) setSceneElement(shape);
@@ -892,13 +932,34 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
   const roomId = await loadPreviousShapes();
 
   function sendShapeMessage(shape: Shape) {
-    const message = {
+    sendPersistent({
       type: "canvas:create",
       roomId,
       operationId: crypto.randomUUID(),
       element: shape,
-    };
-    socket.send(JSON.stringify(message));
+    });
+  }
+
+  function sendPersistent(message: unknown) {
+    if (socket.readyState !== WebSocket.OPEN) {
+      window.dispatchEvent(
+        new CustomEvent("canvas:persistence-error", {
+          detail: "Disconnected: drawing change is not saved",
+        }),
+      );
+      return false;
+    }
+    try {
+      socket.send(JSON.stringify(message));
+      return true;
+    } catch {
+      window.dispatchEvent(
+        new CustomEvent("canvas:persistence-error", {
+          detail: "Drawing change could not be sent",
+        }),
+      );
+      return false;
+    }
   }
 
   // --------------------------------------------------
@@ -913,22 +974,82 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     y: (clientY - state.offsetY) / state.scale,
   });
 
-  //  new chnages 
+  const freehandBuilder = new FreehandBuilder(() => state.scale);
+  const drawingInput = new PointerToolLifecycle(
+    canvas,
+    {
+      enabled: () =>
+        ["freehand", "eraser", "precision-eraser"].includes(
+          modeRef.current ?? "",
+        ),
+      down: (event, point) => {
+        pointerToolActive = true;
+        activePointerTool = modeRef.current as typeof activePointerTool;
+        state.selectedShapeIds = [];
+        state.isMarqueeSelecting = false;
+        if (activePointerTool === "freehand") {
+          state.isFreehandDrawing = true;
+          freehandBuilder.clear();
+          freehandBuilder.add(point, event.pointerType);
+          state.freehandPoints = freehandBuilder.getRawPoints();
+        } else {
+          state.isErasing = true;
+          state.eraserPoints = [point];
+        }
+        scheduleRender();
+      },
+      move: (event, point) => {
+        if (activePointerTool === "freehand") {
+          freehandBuilder.add(point, event.pointerType);
+          state.freehandPoints = freehandBuilder.getRawPoints();
+        } else if (activePointerTool && state.eraserPoints.length < 4096) {
+          const last = state.eraserPoints.at(-1)!;
+          if (
+            Math.hypot(point.x - last.x, point.y - last.y) >
+            Math.max(0.5, 1 / state.scale)
+          )
+            state.eraserPoints.push(point);
+        }
+        scheduleRender();
+      },
+      up: () => {
+        if (activePointerTool === "freehand") finalizeFreehandDrawing();
+        else if (activePointerTool) finalizeEraserDrawing();
+        activePointerTool = null;
+        pointerToolActive = false;
+      },
+      cancel: () => {
+        state.isFreehandDrawing = false;
+        state.isErasing = false;
+        state.freehandPoints = [];
+        state.eraserPoints = [];
+        activePointerTool = null;
+        pointerToolActive = false;
+        freehandBuilder.clear();
+        scheduleRender();
+      },
+    },
+    clientToWorld,
+  );
 
-
-
+  //  new chnages
 
   function handleMouseDown(e: MouseEvent) {
+    if (
+      pointerToolActive ||
+      ["freehand", "eraser", "precision-eraser"].includes(modeRef.current ?? "")
+    )
+      return;
     // `ctx` is guaranteed non-null here due to the initial check in initDraw
     const { x: worldX, y: worldY } = clientToWorld(e.clientX, e.clientY);
     const isCtrlOrCmdPressed = e.ctrlKey || e.metaKey;
-  
+
     // 1. Handle active text preview (highest priority as it's an overlay)
     if (state.textPreview && modeRef.current === "text") {
       activeTextCleanup?.(); // Finalize current text input
       return;
     }
-  
+
     // 2. Handle right-click for panning (second highest priority)
     if (e.button === 2) {
       state.isPanning = true;
@@ -939,22 +1060,22 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
       scheduleRender();
       return;
     }
-  
+
     // 3. Handle interactions based on the current drawing mode (left-click)
     switch (modeRef.current) {
       case "select":
         handleSelectionStart(worldX, worldY, isCtrlOrCmdPressed);
         break;
-  
+
       case "freehand":
       case "eraser":
-        startFreehandOrEraser(worldX, worldY, modeRef.current);
+      case "precision-eraser":
         break;
-  
+
       case "text":
         // Text input is handled by double-click, so single click does nothing specific here
         break;
-  
+
       case "rect":
       case "circle":
       case "line":
@@ -962,7 +1083,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
       case "arrow":
         startDrawingMode(worldX, worldY);
         break;
-  
+
       case null: // No mode selected, potentially clear selection
         state.selectedShapeIds = [];
         state.isMarqueeSelecting = false;
@@ -970,29 +1091,41 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
         break;
     }
   }
-  
+
   // Helper for starting selection (single or marquee)
-  function handleSelectionStart(worldX: number, worldY: number, isCtrlOrCmdPressed: boolean) {
-    if(!ctx)return;
+  function handleSelectionStart(
+    worldX: number,
+    worldY: number,
+    isCtrlOrCmdPressed: boolean,
+  ) {
+    if (!ctx) return;
     let clickedShapeId: string | null = null;
     // Iterate backwards to find the topmost shape that was clicked
     const tolerance = 8 / state.scale;
-    const candidates = scene.query({ minX: worldX-tolerance, minY: worldY-tolerance, maxX: worldX+tolerance, maxY: worldY+tolerance });
+    const candidates = scene.query({
+      minX: worldX - tolerance,
+      minY: worldY - tolerance,
+      maxX: worldX + tolerance,
+      maxY: worldY + tolerance,
+    });
     for (let i = candidates.length - 1; i >= 0; i--) {
       const shape = candidates[i];
-      if (shape) { // Type guard for safety
+      if (shape) {
+        // Type guard for safety
         const bounds = getShapeBounds(ctx, shape as unknown as Shape);
         if (
           bounds &&
-          worldX >= bounds.x && worldX <= bounds.x + bounds.width &&
-          worldY >= bounds.y && worldY <= bounds.y + bounds.height
+          worldX >= bounds.x &&
+          worldX <= bounds.x + bounds.width &&
+          worldY >= bounds.y &&
+          worldY <= bounds.y + bounds.height
         ) {
           clickedShapeId = shape.id;
           break;
         }
       }
     }
-  
+
     if (clickedShapeId) {
       const isAlreadySelected = state.selectedShapeIds.includes(clickedShapeId);
       if (isCtrlOrCmdPressed) {
@@ -1018,22 +1151,27 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     }
     scheduleRender();
   }
-  
+
   // Helper for starting freehand or eraser drawing
-  function startFreehandOrEraser(worldX: number, worldY: number, mode: "freehand" | "eraser") {
+  function startFreehandOrEraser(
+    worldX: number,
+    worldY: number,
+    mode: "freehand" | "eraser",
+  ) {
     state.selectedShapeIds = []; // Clear selection when starting a new drawing
     state.isMarqueeSelecting = false; // Ensure marquee is off
     const points = [{ x: worldX, y: worldY }];
     if (mode === "eraser") {
       state.isErasing = true;
       state.eraserPoints = points;
-    } else { // freehand
+    } else {
+      // freehand
       state.isFreehandDrawing = true;
       state.freehandPoints = points;
     }
     scheduleRender();
   }
-  
+
   // Helper for starting a new shape drawing
   function startDrawingMode(worldX: number, worldY: number) {
     state.selectedShapeIds = []; // Clear selection when starting a new drawing
@@ -1045,12 +1183,16 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     state.currentY = worldY;
     scheduleRender();
   }
-  
-  
+
   // Mousemove handler.
   function handleMouseMove(e: MouseEvent) {
+    if (
+      pointerToolActive ||
+      ["freehand", "eraser", "precision-eraser"].includes(modeRef.current ?? "")
+    )
+      return;
     const { x: worldX, y: worldY } = clientToWorld(e.clientX, e.clientY);
-  
+
     // Prioritize active drawing/panning states
     if (state.isErasing) {
       state.eraserPoints.push({ x: worldX, y: worldY });
@@ -1071,20 +1213,25 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     }
     scheduleRender(); // Only render if a state change occurred
   }
-  
+
   // Mouseup handler.
   function handleMouseUp(e: MouseEvent) {
+    if (
+      pointerToolActive ||
+      ["freehand", "eraser", "precision-eraser"].includes(modeRef.current ?? "")
+    )
+      return;
     // `ctx` is guaranteed non-null here due to the initial check in initDraw
     const { x: worldX, y: worldY } = clientToWorld(e.clientX, e.clientY);
     const isCtrlOrCmdPressed = e.ctrlKey || e.metaKey;
-  
+
     // 1. Handle right-click for ending panning
     if (e.button === 2 && state.isPanning) {
       state.isPanning = false;
       // No scheduleRender needed here, as mousemove already did it on last pan
       return;
     }
-  
+
     // 2. Handle ending actions based on the current drawing mode
     switch (modeRef.current) {
       case "freehand":
@@ -1092,13 +1239,13 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
           finalizeFreehandDrawing();
         }
         break;
-  
+
       case "eraser":
         if (state.isErasing) {
           finalizeEraserDrawing();
         }
         break;
-  
+
       case "rect":
       case "circle":
       case "line":
@@ -1108,29 +1255,30 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
           finalizeDrawingMode(worldX, worldY);
         }
         break;
-  
+
       case "select":
         if (state.isMarqueeSelecting) {
           endMarqueeSelection(worldX, worldY, isCtrlOrCmdPressed);
         }
         // If it was a single click in select mode (not marquee), no action needed here
         break;
-  
+
       case "text":
       case null:
         // No specific mouseup action for these modes
         break;
     }
   }
-  
+
   // Helper for finalizing freehand drawing
   function finalizeFreehandDrawing() {
     state.isFreehandDrawing = false;
-    if (state.freehandPoints.length > 0) { // Only add if points exist
+    if (state.freehandPoints.length > 0) {
+      // Only add if points exist
       const newShape: Shape = {
         id: crypto.randomUUID(),
         type: "freehand",
-        points: state.freehandPoints,
+        points: freehandBuilder.getPoints(),
         strokeColor: strokeColorRef.current,
         strokeWidth: strokeWidthRef.current,
       };
@@ -1139,32 +1287,134 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
       sendShapeMessage(newShape);
     }
     state.freehandPoints = [];
+    freehandBuilder.clear();
     scheduleRender();
   }
-  
+
   // Helper for finalizing eraser drawing
   function finalizeEraserDrawing() {
     state.isErasing = false;
-    if (state.eraserPoints.length > 0) { // Only add if points exist
-      const newShape: Shape = {
-        id: crypto.randomUUID(),
-        type: "eraser",
-        points: state.eraserPoints,
-        size: strokeWidthRef.current * 10,
-      };
-      state.shapes.push(newShape);
-      setSceneElement(newShape);
-      sendShapeMessage(newShape);
-    }
+    const trajectory = state.eraserPoints.slice();
+    const precise = activePointerTool === "precision-eraser";
     state.eraserPoints = [];
+    if (trajectory.length) eraseAlongPath(trajectory, precise);
     scheduleRender();
   }
-  
+
+  function eraseAlongPath(trajectory: Point[], precise: boolean) {
+    const radius = (strokeWidthRef.current * 5) / state.scale;
+    const bounds = {
+      minX: Math.min(...trajectory.map((p) => p.x)) - radius,
+      minY: Math.min(...trajectory.map((p) => p.y)) - radius,
+      maxX: Math.max(...trajectory.map((p) => p.x)) + radius,
+      maxY: Math.max(...trajectory.map((p) => p.y)) + radius,
+    };
+    const candidates = scene
+      .query(bounds)
+      .filter((shape) => sweptIntersects(shape, trajectory, radius));
+    const shapeIndexes = new Map(
+      state.shapes.map((shape, index) => [shape.id, index]),
+    );
+    const deleteOperations: Array<{
+      kind: "delete";
+      operationId: string;
+      elementId: string;
+    }> = [];
+    const precisionBatches: Array<
+      Array<{
+        kind: "delete" | "create";
+        operationId: string;
+        elementId?: string;
+        element?: Shape;
+      }>
+    > = [];
+    const replacements = new Map<string, Shape[]>();
+    const deletions = new Set<string>();
+    for (const candidate of candidates) {
+      const shape = candidate as unknown as Shape;
+      const index = shapeIndexes.get(shape.id);
+      if (index === undefined || deletions.has(shape.id)) continue;
+      if (precise && shape.type === "freehand") {
+        const pieces = splitFreehand(
+          shape.points,
+          trajectory,
+          radius,
+          shape.strokeWidth,
+        );
+        const operations: Array<{
+          kind: "delete" | "create";
+          operationId: string;
+          elementId?: string;
+          element?: Shape;
+        }> = [
+          {
+            kind: "delete",
+            operationId: crypto.randomUUID(),
+            elementId: shape.id,
+          },
+        ];
+        const orderedPieces = pieces.map((points, part) => ({
+          ...shape,
+          id: crypto.randomUUID(),
+          points,
+          order: index + (part + 1) / (pieces.length + 1),
+        })) as Shape[];
+        if (operations.length + orderedPieces.length > 100) {
+          window.dispatchEvent(
+            new CustomEvent("canvas:persistence-error", {
+              detail: "This stroke produced too many pieces to erase safely",
+            }),
+          );
+          continue;
+        }
+        for (const element of orderedPieces)
+          operations.push({
+            kind: "create",
+            operationId: crypto.randomUUID(),
+            element,
+          });
+        precisionBatches.push(operations);
+        deletions.add(shape.id);
+        replacements.set(shape.id, orderedPieces);
+      } else {
+        deleteOperations.push({
+          kind: "delete",
+          operationId: crypto.randomUUID(),
+          elementId: shape.id,
+        });
+        deletions.add(shape.id);
+      }
+    }
+    if (!deletions.size) return;
+    const next: Shape[] = [];
+    for (const shape of state.shapes) {
+      if (!deletions.has(shape.id)) next.push(shape);
+      else next.push(...(replacements.get(shape.id) ?? []));
+    }
+    state.shapes = next;
+    for (const id of deletions) scene.delete(id);
+    for (const pieces of replacements.values())
+      for (const piece of pieces) setSceneElement(piece);
+    state.selectedShapeIds = state.selectedShapeIds.filter(
+      (id) => !deletions.has(id),
+    );
+    renderer.invalidateScene();
+    for (const batch of precisionBatches)
+      sendPersistent({ type: "canvas:batch", roomId, operations: batch });
+    for (let i = 0; i < deleteOperations.length; i += 100) {
+      sendPersistent({
+        type: "canvas:batch",
+        roomId,
+        operations: deleteOperations.slice(i, i + 100),
+      });
+    }
+  }
+
   // Helper for finalizing regular shape drawing
   function finalizeDrawingMode(finalX: number, finalY: number) {
     state.isDrawing = false;
     let newShape: Shape | null = null;
-  
+
     switch (modeRef.current) {
       case "rect":
         newShape = {
@@ -1237,7 +1487,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
         };
         break;
     }
-  
+
     if (newShape) {
       state.shapes.push(newShape);
       setSceneElement(newShape);
@@ -1247,57 +1497,68 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     state.currentY = undefined;
     scheduleRender();
   }
-  
+
   // Helper for ending marquee selection
-  function endMarqueeSelection(worldX: number, worldY: number, isCtrlOrCmdPressed: boolean) {
-    if(!ctx)return;
+  function endMarqueeSelection(
+    worldX: number,
+    worldY: number,
+    isCtrlOrCmdPressed: boolean,
+  ) {
+    if (!ctx) return;
     state.isMarqueeSelecting = false;
-  
+
     const rectX = Math.min(state.marqueeStartX, worldX);
     const rectY = Math.min(state.marqueeStartY, worldY);
     const rectWidth = Math.abs(worldX - state.marqueeStartX);
     const rectHeight = Math.abs(worldY - state.marqueeStartY);
-  
+
     const marqueeBounds = {
       x: rectX,
       y: rectY,
       width: rectWidth,
       height: rectHeight,
     };
-  
+
     // Clear existing selections IF Ctrl/Cmd was NOT pressed (for new marquee selection)
     if (!isCtrlOrCmdPressed) {
       state.selectedShapeIds = [];
     }
-  
+
     // Add shapes that intersect with the marquee selection
-    scene.query({ minX: marqueeBounds.x, minY: marqueeBounds.y, maxX: marqueeBounds.x + marqueeBounds.width, maxY: marqueeBounds.y + marqueeBounds.height }).forEach((shape) => {
-      const shapeBounds = getShapeBounds(ctx,shape as unknown as Shape);
-      if (shapeBounds) {
-        // Check for intersection between marqueeBounds and shapeBounds
-        if (
-          marqueeBounds.x < shapeBounds.x + shapeBounds.width &&
-          marqueeBounds.x + marqueeBounds.width > shapeBounds.x &&
-          marqueeBounds.y < shapeBounds.y + shapeBounds.height &&
-          marqueeBounds.y + marqueeBounds.height > shapeBounds.y
-        ) {
-          // Only add if not already selected (important for Ctrl/Cmd mode)
-          if (!state.selectedShapeIds.includes(shape.id)) {
-            state.selectedShapeIds.push(shape.id);
+    scene
+      .query({
+        minX: marqueeBounds.x,
+        minY: marqueeBounds.y,
+        maxX: marqueeBounds.x + marqueeBounds.width,
+        maxY: marqueeBounds.y + marqueeBounds.height,
+      })
+      .forEach((shape) => {
+        const shapeBounds = getShapeBounds(ctx, shape as unknown as Shape);
+        if (shapeBounds) {
+          // Check for intersection between marqueeBounds and shapeBounds
+          if (
+            marqueeBounds.x < shapeBounds.x + shapeBounds.width &&
+            marqueeBounds.x + marqueeBounds.width > shapeBounds.x &&
+            marqueeBounds.y < shapeBounds.y + shapeBounds.height &&
+            marqueeBounds.y + marqueeBounds.height > shapeBounds.y
+          ) {
+            // Only add if not already selected (important for Ctrl/Cmd mode)
+            if (!state.selectedShapeIds.includes(shape.id)) {
+              state.selectedShapeIds.push(shape.id);
+            }
           }
         }
-      }
-    });
-  
+      });
+
     // Reset marquee coordinates
     state.marqueeStartX = 0;
     state.marqueeStartY = 0;
     state.marqueeCurrentX = 0;
     state.marqueeCurrentY = 0;
-  
+
     scheduleRender(); // Rerender to show new selections
   }
-  
+
   // Wheel (zoom) handler.
   function handleWheel(e: WheelEvent) {
     e.preventDefault();
@@ -1408,6 +1669,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
 
   return {
     cleanup: function cleanup() {
+      drawingInput.dispose();
       canvas.removeEventListener("mousedown", handleMouseDown);
       canvas.removeEventListener("mousemove", handleMouseMove);
       canvas.removeEventListener("mouseup", handleMouseUp);
@@ -1425,7 +1687,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     },
     addShapeLocally: addShapeLocally,
     isCanvasEmpty: isCanvasEmpty,
-    getSelectedShapesInfo: getSelectedShapesInfo, 
+    getSelectedShapesInfo: getSelectedShapesInfo,
     deleteShapeById: deleteShapeById,
     clearLocally,
     captureSelectedAreaBlob: captureSelectedAreaBlob,

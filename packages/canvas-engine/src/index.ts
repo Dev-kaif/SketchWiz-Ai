@@ -6,3 +6,5 @@ export * from "./renderer.js";
 export * from "./engine.js";
 export * from "./resources.js";
 export * from "./input.js";
+export * from "./tools.js";
+export * from "./eraser.js";
