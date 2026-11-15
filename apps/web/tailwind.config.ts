@@ -1,9 +1,8 @@
 // tailwind.config.ts
-import type { Config } from "tailwindcss";
 import sharedConfig from "@repo/tailwind-config";
 import animate from "tailwindcss-animate";
 
-const config: Config = {
+const config = {
   darkMode: ["class"],
   content: [
     "./app/**/*.tsx",
