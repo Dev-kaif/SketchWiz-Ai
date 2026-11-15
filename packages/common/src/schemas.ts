@@ -72,6 +72,7 @@ export const WebSocketMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("canvas:batch"),
     roomId: z.number().int().positive(),
+    clear: z.boolean().optional(),
     expectedRevision: z.number().int().nonnegative().safe().optional(),
     operations: z
       .array(canvasMutation)

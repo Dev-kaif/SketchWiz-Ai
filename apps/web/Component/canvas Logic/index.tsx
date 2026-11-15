@@ -23,6 +23,7 @@ import {
   type CanvasElement,
   type ToolPoint,
 } from "@repo/canvas-engine";
+import { CanvasCollaborationAdapter } from "./collaboration";
 
 type Point = { x: number; y: number; pressure?: number };
 const MIN_CANVAS_ZOOM = 0.1;
@@ -156,6 +157,7 @@ let activeTextCleanup: (() => void) | null = null;
 
 interface InitDrawControls {
   cleanup: () => void;
+  setSocket: (socket: WebSocket | null) => void;
   addShapeLocally: (shape: Shape) => void;
   isCanvasEmpty: () => boolean;
   getSelectedShapesInfo: () => Array<{
@@ -184,7 +186,8 @@ interface InitDrawControls {
   setZoom: (zoom: number) => void;
   zoomBy: (factor: number) => void;
   setViewportCenter: (x: number, y: number) => void;
-  clearLocally: () => void;
+  clearCanvas: () => boolean;
+  resetView: (fallback?: Point) => void;
   captureSelectedAreaBlob: () => Promise<Blob | null>;
 }
 
@@ -242,6 +245,7 @@ export default async function initDraw(
     // Return a dummy object with no-op functions if context is null
     return {
       cleanup: () => {},
+      setSocket: () => {},
       addShapeLocally: () => {},
       isCanvasEmpty: () => true,
       getSelectedShapesInfo: () => [],
@@ -251,7 +255,8 @@ export default async function initDraw(
       setZoom: () => {},
       zoomBy: () => {},
       setViewportCenter: () => {},
-      clearLocally: () => {},
+      clearCanvas: () => false,
+      resetView: () => {},
       captureSelectedAreaBlob: () => Promise.resolve(null),
     };
   }
@@ -288,6 +293,10 @@ export default async function initDraw(
       remaining: Set<string>;
     }
   >();
+  const remotePreviews = new Map<string, CanvasElement>();
+  let collaboration: CanvasCollaborationAdapter;
+  let lastPresenceSentAt = 0;
+  let lastPreviewSentAt = 0;
   let historyBusy = false;
   let activeTransform: {
     kind: "move" | "resize" | "rotate";
@@ -325,12 +334,32 @@ export default async function initDraw(
     return state.shapes.length === 0;
   }
 
-  function clearLocally() {
+  function clearCanvas() {
+    const existing = [...state.shapes];
+    if (!existing.length) return true;
     state.shapes = [];
     state.selectedShapeIds = [];
     scene.clear();
     renderer.invalidateScene();
+    for (let start = 0; start < existing.length; start += 100) {
+      const changes: ElementChange[] = existing
+        .slice(start, start + 100)
+        .map((shape) => ({
+          id: shape.id,
+          before: shape as unknown as CanvasElement,
+          after: null,
+        }));
+      if (
+        !persistHistory({ label: "Clear canvas", changes }, "push", {
+          clear: true,
+        })
+      ) {
+        scheduleRender();
+        return false;
+      }
+    }
     scheduleRender();
+    return true;
   }
 
   const imageCache = new Map<string, HTMLImageElement>();
@@ -750,11 +779,73 @@ export default async function initDraw(
       renderer.invalidateScene();
       renderedCamera = { x: camera.x, y: camera.y, zoom: camera.zoom };
     }
+    const drawingPreview = new Map<string, CanvasElement>();
+    const baseStyle = {
+      id: "local-drawing-preview",
+      strokeColor: strokeColorRef.current,
+      strokeWidth: strokeWidthRef.current,
+    };
+    if (state.isFreehandDrawing && state.freehandPoints.length) {
+      drawingPreview.set("local-drawing-preview", {
+        ...baseStyle,
+        type: "freehand",
+        points: state.freehandPoints,
+      } as CanvasElement);
+    } else if (
+      state.isDrawing &&
+      state.currentX !== undefined &&
+      state.currentY !== undefined
+    ) {
+      const x1 = state.startX;
+      const y1 = state.startY;
+      const x2 = state.currentX;
+      const y2 = state.currentY;
+      let shape: Shape | null = null;
+      if (modeRef.current === "rect")
+        shape = {
+          ...baseStyle,
+          type: "rectangle",
+          x: Math.min(x1, x2),
+          y: Math.min(y1, y2),
+          width: Math.abs(x2 - x1),
+          height: Math.abs(y2 - y1),
+        };
+      else if (modeRef.current === "circle")
+        shape = {
+          ...baseStyle,
+          type: "circle",
+          x: (x1 + x2) / 2,
+          y: (y1 + y2) / 2,
+          radiusX: Math.abs(x2 - x1) / 2,
+          radiusY: Math.abs(y2 - y1) / 2,
+        };
+      else if (modeRef.current === "line" || modeRef.current === "arrow")
+        shape = { ...baseStyle, type: modeRef.current, x1, y1, x2, y2 };
+      else if (modeRef.current === "triangle") {
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        shape = {
+          ...baseStyle,
+          type: "triangle",
+          x1,
+          y1,
+          x2,
+          y2,
+          x3: (x1 + x2) / 2 - dy * (Math.sqrt(3) / 2),
+          y3: (y1 + y2) / 2 + dx * (Math.sqrt(3) / 2),
+        };
+      }
+      if (shape)
+        drawingPreview.set(
+          "local-drawing-preview",
+          shape as unknown as CanvasElement,
+        );
+    }
     renderer.render(
       scene,
       camera,
       new Set(state.selectedShapeIds),
-      transformPreviews,
+      new Map([...remotePreviews, ...drawingPreview, ...transformPreviews]),
       hiddenTransformIds,
     );
     const rect = canvas.getBoundingClientRect();
@@ -814,65 +905,8 @@ export default async function initDraw(
       ctx.restore();
     }
 
-    // 2. Preview for regular shapes (rect, circle, line, triangle, arrow).
-    if (
-      state.isDrawing &&
-      state.currentX !== undefined &&
-      state.currentY !== undefined // Ensure currentX/Y are defined for preview
-    ) {
-      ctx.save();
-      ctx.lineJoin = "round";
-      ctx.lineCap = "round";
-      ctx.shadowColor = strokeColorRef.current;
-      ctx.strokeStyle = strokeColorRef.current;
-      ctx.lineWidth = strokeWidthRef.current;
-      const startX = state.startX;
-      const startY = state.startY;
-      const currentX = state.currentX;
-      const currentY = state.currentY;
-      if (modeRef.current === "rect") {
-        ctx.strokeRect(startX, startY, currentX - startX, currentY - startY);
-      } else if (modeRef.current === "circle") {
-        const centerX = (startX + currentX) / 2;
-        const centerY = (startY + currentY) / 2;
-        const radiusX = Math.abs(currentX - startX) / 2;
-        const radiusY = Math.abs(currentY - startY) / 2;
-        ctx.beginPath();
-        ctx.ellipse(centerX, centerY, radiusX, radiusY, 0, 0, Math.PI * 2);
-        ctx.stroke();
-      } else if (modeRef.current === "line" || modeRef.current === "arrow") {
-        ctx.beginPath();
-        ctx.moveTo(startX, startY);
-        ctx.lineTo(currentX, currentY);
-        ctx.stroke();
-      } else if (modeRef.current === "triangle") {
-        const dx = currentX - startX;
-        const dy = currentY - startY;
-        const midX = (startX + currentX) / 2;
-        const midY = (startY + currentY) / 2;
-        // This calculates a point for an equilateral triangle.
-        // For a more general triangle, it might need to use other points.
-        const thirdX = midX - dy * (Math.sqrt(3) / 2);
-        const thirdY = midY + dx * (Math.sqrt(3) / 2); // Corrected `+ dx` for rotation
-        ctx.beginPath();
-        ctx.moveTo(startX, startY);
-        ctx.lineTo(currentX, currentY);
-        ctx.lineTo(thirdX, thirdY);
-        ctx.closePath();
-        ctx.stroke();
-      }
-      ctx.restore();
-    }
-
-    // 3. Preview for freehand pencil.
-    if (state.isFreehandDrawing && state.freehandPoints.length > 0) {
-      ctx.save();
-      ctx.strokeStyle = strokeColorRef.current;
-      traceFreehand(ctx, state.freehandPoints, strokeWidthRef.current);
-      ctx.restore();
-    }
-
-    // 4. Preview for eraser.
+    // The renderer draws active geometry on its cleared overlay layer.
+    // Keep only the eraser cursor here because it is a screen-space indicator.
     if (state.isErasing && state.eraserPoints.length > 0) {
       ctx.save();
       ctx.globalCompositeOperation = "source-over";
@@ -925,16 +959,10 @@ export default async function initDraw(
   }
 
   function requestCanvasSync() {
-    if (roomIdForSync === null || socket.readyState !== WebSocket.OPEN) return;
+    if (roomIdForSync === null) return;
     if (requestedSyncRevision === canvasRevision) return;
     requestedSyncRevision = canvasRevision;
-    socket.send(
-      JSON.stringify({
-        type: "canvas:sync",
-        roomId: roomIdForSync,
-        afterRevision: canvasRevision,
-      }),
-    );
+    collaboration.sync(roomIdForSync, canvasRevision);
   }
 
   function applyRevisionedOperation(operation: any) {
@@ -987,38 +1015,76 @@ export default async function initDraw(
 
   function applyServerMessage(data: any) {
     if (data.type === "canvas:ack") {
+      const ackIds = Array.isArray(data.operationIds) ? data.operationIds : [];
       if (data.error) {
-        const pending = new Set(pendingHistoryByOperation.values());
-        for (const group of pending) {
-          for (const id of group.remaining)
+        const rejectedIds = ackIds
+          .map((item: any) => item.operationId)
+          .filter(Boolean);
+        const affectedIds = rejectedIds.length
+          ? rejectedIds
+          : [...pendingHistoryByOperation.keys()];
+        const groups = new Set<
+          NonNullable<ReturnType<typeof pendingHistoryByOperation.get>>
+        >();
+        for (const id of affectedIds) {
+          const group = pendingHistoryByOperation.get(id);
+          if (group) groups.add(group);
+        }
+        for (const group of groups) {
+          for (const change of group.entry.changes) {
+            const rollback =
+              group.action === "push"
+                ? change.before
+                : group.action === "undo"
+                  ? change.after
+                  : change.before;
+            setLocalElement(change.id, rollback);
+          }
+          for (const id of group.remaining) {
             pendingHistoryByOperation.delete(id);
+            localOperationIds.delete(id);
+          }
           if (group.action === "undo") history.restoreUndo(group.entry);
           else if (group.action === "redo") history.restoreRedo(group.entry);
         }
+        collaboration.reject(affectedIds);
         historyBusy = false;
         window.dispatchEvent(
           new CustomEvent("canvas:persistence-error", {
             detail: "A canvas change was rejected; syncing saved state",
           }),
         );
-      } else if (Array.isArray(data.operationIds)) {
-        acknowledgeHistory(data.operationIds);
+        requestCanvasSync();
+      } else {
+        collaboration.acknowledge(ackIds);
+        acknowledgeHistory(ackIds);
+        const revisions = ackIds
+          .map((item: any) => Number(item.revision))
+          .filter(
+            (revision: number) =>
+              Number.isSafeInteger(revision) && revision > canvasRevision,
+          )
+          .sort((a: number, b: number) => a - b);
+        let expected = canvasRevision + 1;
+        for (const revision of revisions) {
+          if (revision !== expected) break;
+          canvasRevision = revision;
+          expected += 1;
+        }
+        if (Number(data.revision) > canvasRevision) requestCanvasSync();
       }
-      // The acknowledgement confirms durability, but another client's operation
-      // may precede this revision. Recover from our last applied revision.
-      requestCanvasSync();
       return;
     }
     if (data.type === "canvas:sync" && data.mode) {
       requestedSyncRevision = null;
       if (data.mode === "snapshot") {
+        const pendingGroups = [...new Set(pendingHistoryByOperation.values())];
         history.invalidate([
           ...state.shapes.map((shape) => shape.id),
           ...(Array.isArray(data.elements)
             ? data.elements.map((shape: Shape) => shape.id)
             : []),
         ]);
-        localOperationIds.clear();
         state.shapes = Array.isArray(data.elements)
           ? (data.elements as Shape[])
           : [];
@@ -1026,11 +1092,54 @@ export default async function initDraw(
         renderer.invalidateScene();
         for (const shape of state.shapes) setSceneElement(shape);
         canvasRevision = Number(data.revision) || 0;
+        for (const group of pendingGroups) {
+          for (const change of group.entry.changes) {
+            const optimistic =
+              group.action === "undo" ? change.before : change.after;
+            setLocalElement(change.id, optimistic);
+          }
+        }
         scheduleRender();
       } else if (data.mode === "operations" && Array.isArray(data.operations)) {
         data.operations.forEach(applyRevisionedOperation);
       }
       if (data.hasMore) requestCanvasSync();
+      return;
+    }
+    if (data.type === "presence:update" || data.type === "presence:leave") {
+      if (data.type === "presence:leave" || data.presence?.active === false) {
+        for (const key of remotePreviews.keys())
+          if (key.startsWith(`${data.userId}:`)) remotePreviews.delete(key);
+        renderer.invalidateScene();
+        scheduleRender();
+      }
+      window.dispatchEvent(
+        new CustomEvent("canvas:remote-presence", { detail: data }),
+      );
+      return;
+    }
+    if (data.type === "canvas:preview") {
+      const userId = String(data.userId ?? "");
+      const elements = Array.isArray(data.preview?.elements)
+        ? data.preview.elements
+        : [];
+      for (const key of remotePreviews.keys())
+        if (key.startsWith(`${userId}:`)) remotePreviews.delete(key);
+      if (data.preview?.active !== false) {
+        for (const element of elements) {
+          if (
+            element &&
+            typeof element.id === "string" &&
+            typeof element.type === "string"
+          )
+            remotePreviews.set(
+              `${userId}:${element.id}`,
+              element as CanvasElement,
+            );
+        }
+      }
+      renderer.invalidateScene();
+      scheduleRender();
       return;
     }
     if (data.type === "canvas:batch" && Array.isArray(data.operations)) {
@@ -1062,13 +1171,8 @@ export default async function initDraw(
     if (data.type === "ai") setAiResponse(data.message);
   }
 
-  socket.onmessage = (event) => {
-    try {
-      applyServerMessage(JSON.parse(event.data));
-    } catch {
-      // Ignore malformed server frames without interrupting canvas input.
-    }
-  };
+  collaboration = new CanvasCollaborationAdapter(applyServerMessage);
+  collaboration.attach(socket);
 
   async function loadPreviousShapes() {
     const slug = (await params).slug;
@@ -1084,8 +1188,7 @@ export default async function initDraw(
     for (const shape of state.shapes) setSceneElement(shape);
     canvasRevision = Number(res.data.revision) || 0;
     scheduleRender();
-    socket.send(JSON.stringify({ type: "join_room", roomId }));
-    requestCanvasSync();
+    collaboration.joinRoom(roomId, () => canvasRevision);
     return roomId;
   }
 
@@ -1108,25 +1211,7 @@ export default async function initDraw(
   }
 
   function sendPersistent(message: unknown) {
-    if (socket.readyState !== WebSocket.OPEN) {
-      window.dispatchEvent(
-        new CustomEvent("canvas:persistence-error", {
-          detail: "Disconnected: drawing change is not saved",
-        }),
-      );
-      return false;
-    }
-    try {
-      socket.send(JSON.stringify(message));
-      return true;
-    } catch {
-      window.dispatchEvent(
-        new CustomEvent("canvas:persistence-error", {
-          detail: "Drawing change could not be sent",
-        }),
-      );
-      return false;
-    }
+    return collaboration.sendPersistent(message as Record<string, unknown>);
   }
 
   function setLocalElement(id: string, element: CanvasElement | null) {
@@ -1146,6 +1231,7 @@ export default async function initDraw(
   function persistHistory(
     entry: HistoryEntry,
     action: "push" | "undo" | "redo",
+    options: { clear?: boolean } = {},
   ) {
     if (roomIdForSync === null) return false;
     const operations: Array<Record<string, unknown>> = [];
@@ -1199,10 +1285,16 @@ export default async function initDraw(
         type: "canvas:batch",
         roomId,
         operations,
+        ...(options.clear ? { clear: true } : {}),
         ...(action === "push" ? {} : { expectedRevision: canvasRevision }),
       })
-    )
+    ) {
+      if (action === "push")
+        for (const change of entry.changes)
+          setLocalElement(change.id, change.before);
+      scheduleRender();
       return false;
+    }
     if (action !== "push")
       for (const change of entry.changes)
         setLocalElement(
@@ -1264,6 +1356,29 @@ export default async function initDraw(
   };
 
   const freehandBuilder = new FreehandBuilder(() => state.scale);
+  const publishFreehandPreview = (active: boolean) => {
+    if (roomIdForSync === null) return;
+    if (active && Date.now() - lastPreviewSentAt < 50) return;
+    lastPreviewSentAt = Date.now();
+    collaboration.sendEphemeral({
+      type: "canvas:preview",
+      roomId: roomIdForSync,
+      preview: {
+        active,
+        elements: active
+          ? [
+              {
+                id: "active-freehand-preview",
+                type: "freehand",
+                points: state.freehandPoints.slice(-500),
+                strokeColor: strokeColorRef.current,
+                strokeWidth: strokeWidthRef.current,
+              },
+            ]
+          : [],
+      },
+    });
+  };
   const drawingInput = new PointerToolLifecycle(
     canvas,
     {
@@ -1282,6 +1397,7 @@ export default async function initDraw(
           freehandBuilder.clear();
           freehandBuilder.add(point, event.pointerType);
           state.freehandPoints = freehandBuilder.getRawPoints();
+          publishFreehandPreview(true);
         } else {
           state.isErasing = true;
           state.eraserPoints = [point];
@@ -1292,6 +1408,7 @@ export default async function initDraw(
         if (activePointerTool === "freehand") {
           freehandBuilder.add(point, event.pointerType);
           state.freehandPoints = freehandBuilder.getRawPoints();
+          publishFreehandPreview(true);
         } else if (activePointerTool && state.eraserPoints.length < 4096) {
           const last = state.eraserPoints.at(-1)!;
           if (
@@ -1305,10 +1422,12 @@ export default async function initDraw(
       up: () => {
         if (activePointerTool === "freehand") finalizeFreehandDrawing();
         else if (activePointerTool) finalizeEraserDrawing();
+        publishFreehandPreview(false);
         activePointerTool = null;
         pointerToolActive = false;
       },
       cancel: () => {
+        publishFreehandPreview(false);
         state.isFreehandDrawing = false;
         state.isErasing = false;
         state.freehandPoints = [];
@@ -1557,6 +1676,12 @@ export default async function initDraw(
         changes.push({ id, before: before as unknown as CanvasElement, after });
     }
     activeTransform = null;
+    if (roomIdForSync !== null)
+      collaboration.sendEphemeral({
+        type: "canvas:preview",
+        roomId: roomIdForSync,
+        preview: { active: false, elements: [] },
+      });
     transformPreviews.clear();
     hiddenTransformIds.clear();
     for (const change of changes) setLocalElement(change.id, change.after);
@@ -1599,6 +1724,24 @@ export default async function initDraw(
 
   // Mousemove handler.
   function handleMouseMove(e: MouseEvent) {
+    if (roomIdForSync !== null && Date.now() - lastPresenceSentAt >= 50) {
+      lastPresenceSentAt = Date.now();
+      const cursor = clientToWorld(e.clientX, e.clientY);
+      const bounds = canvas.getBoundingClientRect();
+      collaboration.sendEphemeral({
+        type: "presence:update",
+        roomId: roomIdForSync,
+        presence: {
+          x: cursor.x,
+          y: cursor.y,
+          active:
+            e.clientX >= bounds.left &&
+            e.clientX <= bounds.right &&
+            e.clientY >= bounds.top &&
+            e.clientY <= bounds.bottom,
+        },
+      });
+    }
     if (
       pointerToolActive ||
       (isDrawingTool() && !panKeyDown && !state.isPanning)
@@ -1607,6 +1750,14 @@ export default async function initDraw(
     const { x: worldX, y: worldY } = clientToWorld(e.clientX, e.clientY);
     if (activeTransform) {
       updateTransformPreview(worldX, worldY, e.shiftKey);
+      if (Date.now() - lastPreviewSentAt >= 50 && roomIdForSync !== null) {
+        lastPreviewSentAt = Date.now();
+        collaboration.sendEphemeral({
+          type: "canvas:preview",
+          roomId: roomIdForSync,
+          preview: { active: true, elements: [...transformPreviews.values()] },
+        });
+      }
       return;
     }
 
@@ -1629,6 +1780,68 @@ export default async function initDraw(
       // No active drawing/panning/marquee, no need to render
       return;
     }
+    if (
+      (state.isFreehandDrawing || state.isDrawing) &&
+      roomIdForSync !== null &&
+      Date.now() - lastPreviewSentAt >= 50
+    ) {
+      lastPreviewSentAt = Date.now();
+      const preview = state.isFreehandDrawing
+        ? [
+            {
+              id: "active-freehand-preview",
+              type: "freehand",
+              points: state.freehandPoints.slice(-500),
+              strokeColor: strokeColorRef.current,
+              strokeWidth: strokeWidthRef.current,
+            },
+          ]
+        : state.isDrawing &&
+            state.currentX !== undefined &&
+            state.currentY !== undefined
+          ? (() => {
+              const x1 = state.startX,
+                y1 = state.startY;
+              const x2 = state.currentX!,
+                y2 = state.currentY!;
+              const base = {
+                id: "active-shape-preview",
+                strokeColor: strokeColorRef.current,
+                strokeWidth: strokeWidthRef.current,
+              };
+              if (modeRef.current === "rect")
+                return [
+                  {
+                    ...base,
+                    type: "rectangle",
+                    x: Math.min(x1, x2),
+                    y: Math.min(y1, y2),
+                    width: Math.abs(x2 - x1),
+                    height: Math.abs(y2 - y1),
+                  },
+                ];
+              if (modeRef.current === "circle")
+                return [
+                  {
+                    ...base,
+                    type: "circle",
+                    x: (x1 + x2) / 2,
+                    y: (y1 + y2) / 2,
+                    radiusX: Math.abs(x2 - x1) / 2,
+                    radiusY: Math.abs(y2 - y1) / 2,
+                  },
+                ];
+              if (modeRef.current === "arrow" || modeRef.current === "line")
+                return [{ ...base, type: modeRef.current, x1, y1, x2, y2 }];
+              return [];
+            })()
+          : [];
+      collaboration.sendEphemeral({
+        type: "canvas:preview",
+        roomId: roomIdForSync,
+        preview: { active: true, elements: preview },
+      });
+    }
     scheduleRender(); // Only render if a state change occurred
   }
 
@@ -1639,6 +1852,12 @@ export default async function initDraw(
       (isDrawingTool() && !panKeyDown && !state.isPanning)
     )
       return;
+    if (roomIdForSync !== null)
+      collaboration.sendEphemeral({
+        type: "canvas:preview",
+        roomId: roomIdForSync,
+        preview: { active: false, elements: [] },
+      });
     // `ctx` is guaranteed non-null here due to the initial check in initDraw
     const { x: worldX, y: worldY } = clientToWorld(e.clientX, e.clientY);
     if (activeTransform) {
@@ -2114,6 +2333,30 @@ export default async function initDraw(
     scheduleRender();
   }
 
+  function resetView(fallback?: Point) {
+    cancelZoomAnimation();
+    const items = scene.all();
+    const bounds = items.map(boundsOf);
+    const center = bounds.length
+      ? {
+          x:
+            (Math.min(...bounds.map((box) => box.minX)) +
+              Math.max(...bounds.map((box) => box.maxX))) /
+            2,
+          y:
+            (Math.min(...bounds.map((box) => box.minY)) +
+              Math.max(...bounds.map((box) => box.maxY))) /
+            2,
+        }
+      : (fallback ?? { x: 0, y: 0 });
+    const rect = canvas.getBoundingClientRect();
+    state.scale = 1;
+    zoomAnimationTarget = 1;
+    state.offsetX = rect.width / 2 - center.x;
+    state.offsetY = rect.height / 2 - center.y;
+    scheduleRender();
+  }
+
   // --------------------------------------------------
   // Double-click for text input.
   // --------------------------------------------------
@@ -2477,6 +2720,7 @@ export default async function initDraw(
 
   return {
     cleanup: function cleanup() {
+      collaboration.dispose();
       drawingInput.dispose();
       canvas.removeEventListener("mousedown", handleMouseDown);
       window.removeEventListener("mousemove", handleMouseMove);
@@ -2500,6 +2744,7 @@ export default async function initDraw(
         activeTextCleanup();
       }
     },
+    setSocket: (nextSocket) => collaboration.attach(nextSocket),
     addShapeLocally: addShapeLocally,
     isCanvasEmpty: isCanvasEmpty,
     getSelectedShapesInfo: getSelectedShapesInfo,
@@ -2509,7 +2754,8 @@ export default async function initDraw(
     setZoom,
     zoomBy,
     setViewportCenter,
-    clearLocally,
+    clearCanvas,
+    resetView,
     captureSelectedAreaBlob: captureSelectedAreaBlob,
   };
 }

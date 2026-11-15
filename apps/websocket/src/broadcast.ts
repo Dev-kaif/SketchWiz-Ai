@@ -11,6 +11,7 @@ export function broadcast(
   roles: ReadonlyMap<number, RoomRole>,
   checkedUserIds: ReadonlySet<number>,
   except?: WebSocket,
+  exceptUserId?: number,
 ) {
   const recipients = [];
   for (const member of memberships.room(roomId)) {
@@ -23,7 +24,11 @@ export function broadcast(
       continue;
     }
     member.roles.set(roomId, role);
-    if (member.socket === except || member.socket.readyState !== WebSocket.OPEN)
+    if (
+      member.socket === except ||
+      member.userId === exceptUserId ||
+      member.socket.readyState !== WebSocket.OPEN
+    )
       continue;
     if (member.socket.bufferedAmount > MAX_BUFFERED_BYTES) {
       memberships.leave(member, roomId);

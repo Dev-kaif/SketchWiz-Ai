@@ -5,6 +5,7 @@ export type QueuedMessage = { raw: RawData; bytes: number };
 export type Connection = {
   socket: WebSocket;
   userId: number;
+  displayName: string;
   rooms: Set<number>;
   roles: Map<number, RoomRole>;
   queue: QueuedMessage[];

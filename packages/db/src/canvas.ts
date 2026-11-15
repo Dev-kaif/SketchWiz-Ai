@@ -47,6 +47,7 @@ export async function persistCanvasMutations(input: {
   userId: number;
   activeUserIds: number[];
   mutations: CanvasMutation[];
+  requireOwner?: boolean;
   expectedRevision?: number;
   legacyMessage?: unknown;
 }) {
@@ -82,13 +83,9 @@ export async function persistCanvasMutations(input: {
       operations: [],
     });
     if (!canvas || !senderRole) return result(false);
+    if (input.requireOwner && senderRole !== "OWNER")
+      return result(false, senderRole);
     if (senderRole === "VIEWER") return result(false, senderRole);
-    if (
-      input.expectedRevision !== undefined &&
-      input.expectedRevision !== initialRevision
-    )
-      return { ...result(false, senderRole), conflict: true };
-
     let legacyOperationId: string | undefined;
     if (input.legacyMessage !== undefined) {
       const chat = await tx.chat.create({
@@ -122,6 +119,12 @@ export async function persistCanvasMutations(input: {
       existingOperations.some(
         (operation) => operation.canvasId !== canvas.canvasId,
       )
+    )
+      return { ...result(false, senderRole), conflict: true };
+    if (
+      input.expectedRevision !== undefined &&
+      input.expectedRevision !== initialRevision &&
+      mutations.some((mutation) => !operationById.has(mutation.operationId))
     )
       return { ...result(false, senderRole), conflict: true };
 

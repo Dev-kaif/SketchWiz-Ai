@@ -92,7 +92,7 @@ router.get("/room/slug/:slug", async (req, res, next) => {
     if (!room) throw new AppError(404, "Room not found", "ROOM_NOT_FOUND");
     const role = await joinPublicRoom(room.id, req.user!.id);
     if (!role) throw new AppError(404, "Room not found", "ROOM_NOT_FOUND");
-    res.json({ room });
+    res.json({ room, role });
   } catch (error) {
     next(error);
   }
@@ -128,7 +128,8 @@ router.get("/room/:roomId/canvas", async (req, res, next) => {
         throw new AppError(400, "Invalid canvas revision", "INVALID_REVISION");
     }
     const canvas = await getCanvasSync(roomId, afterRevision);
-    if (!canvas) throw new AppError(404, "Canvas not found", "CANVAS_NOT_FOUND");
+    if (!canvas)
+      throw new AppError(404, "Canvas not found", "CANVAS_NOT_FOUND");
     res.json(canvas);
   } catch (error) {
     next(error);

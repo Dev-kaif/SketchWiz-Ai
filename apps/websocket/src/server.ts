@@ -5,6 +5,8 @@ import { FixedWindowLimiter } from "@repo/backend/config";
 import { authenticate, closeUnauthenticated } from "./auth.js";
 import { RoomMembership, type Connection } from "./rooms.js";
 import { handleMessage } from "./messages.js";
+import { client } from "@repo/db/access";
+import { broadcast } from "./broadcast.js";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const MAX_PENDING_BYTES = 20 * 1024 * 1024;
@@ -122,6 +124,7 @@ export function createWebSocketServer(
     const connection: Connection = {
       socket,
       userId,
+      displayName: `User ${userId}`,
       rooms: new Set(),
       roles: new Map(),
       queue: [],
@@ -130,6 +133,17 @@ export function createWebSocketServer(
       closingForBackpressure: false,
       lastEphemeralAt: new Map(),
     };
+    void client.user
+      .findUnique({
+        where: { id: userId },
+        select: { name: true, username: true },
+      })
+      .then((user) => {
+        if (user)
+          connection.displayName =
+            user.name || user.username || connection.displayName;
+      })
+      .catch(() => undefined);
     alive.set(socket, true);
     socket.on("pong", () => alive.set(socket, true));
     logger.info("WebSocket connected", { userId });
@@ -144,6 +158,25 @@ export function createWebSocketServer(
     socket.on("close", () => {
       connection.queue.length = 0;
       connection.queuedBytes = 0;
+      for (const roomId of connection.rooms) {
+        const roomMembers = memberships.room(roomId);
+        const userIds = new Set(
+          [...roomMembers].map((member) => member.userId),
+        );
+        const roles = new Map<number, import("@repo/db/access").RoomRole>();
+        for (const member of roomMembers) {
+          const role = member.roles.get(roomId);
+          if (role) roles.set(member.userId, role);
+        }
+        broadcast(
+          memberships,
+          roomId,
+          { type: "presence:leave", roomId, userId },
+          roles,
+          userIds,
+          socket,
+        );
+      }
       memberships.remove(connection);
       logger.info("WebSocket disconnected", { userId });
     });

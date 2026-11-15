@@ -86,7 +86,27 @@ const Page = ({ params }: Param) => {
   const strokeWidthRef = useRef(strokeWidth);
   const router = useRouter();
   const socket = useSocket();
+  const latestSocketRef = useRef<WebSocket | null>(socket);
+  latestSocketRef.current = socket;
+  const currentUserIdRef = useRef<number | null>(null);
+  const canvasInitStartedRef = useRef(false);
+  const canvasAliveRef = useRef(true);
+  const [connectionStatus, setConnectionStatus] = useState("connecting");
+  const [pendingSaves, setPendingSaves] = useState(0);
+  const [canvasInitRetry, setCanvasInitRetry] = useState(0);
+  const [currentUserId, setCurrentUserId] = useState<number | null>(null);
+  const [collaborators, setCollaborators] = useState<
+    Array<{
+      userId: number;
+      name: string;
+      color: string;
+      x?: number;
+      y?: number;
+    }>
+  >([]);
   const [roomId, setRoomId] = useState();
+  const [roomRole, setRoomRole] = useState<string | null>(null);
+  const [roomOwnerId, setRoomOwnerId] = useState<number | null>(null);
 
   useEffect(() => {
     let lastUpdate = 0;
@@ -129,6 +149,8 @@ const Page = ({ params }: Param) => {
       const roomIdRes = await axios.get(`${BACKEND_URL}/api/room/slug/${slug}`);
       const room = roomIdRes.data.room.id;
       setRoomId(room);
+      setRoomRole(roomIdRes.data.role ?? null);
+      setRoomOwnerId(roomIdRes.data.room.adminId ?? null);
     }
     getRoomId();
   }, [params]);
@@ -198,6 +220,7 @@ const Page = ({ params }: Param) => {
   const cleanupRef = useRef<
     | {
         cleanup: () => void;
+        setSocket: (socket: WebSocket | null) => void;
         addShapeLocally: (shape: Shape) => void;
         isCanvasEmpty: () => boolean;
         getSelectedShapesInfo: () => Array<{
@@ -227,7 +250,8 @@ const Page = ({ params }: Param) => {
         setZoom: (zoom: number) => void;
         zoomBy: (factor: number) => void;
         setViewportCenter: (x: number, y: number) => void;
-        clearLocally: () => void;
+        clearCanvas: () => boolean;
+        resetView: (fallback?: { x: number; y: number }) => void;
         captureSelectedAreaBlob: () => Promise<Blob | null>;
       }
     | undefined
@@ -380,38 +404,107 @@ const Page = ({ params }: Param) => {
     modeRef.current = mode;
   }, [mode]);
 
-  // Initialize canvas (and attach event listeners) when dimensions are available.
+  // Keep the engine alive while the collaboration socket reconnects.
+  useEffect(() => {
+    cleanupRef.current?.setSocket(socket);
+  }, [socket]);
+
+  useEffect(() => {
+    try {
+      const token = localStorage.getItem("authorization");
+      const payload = token?.split(".")[1];
+      if (payload) {
+        const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+        const decoded = JSON.parse(
+          atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=")),
+        );
+        if (Number.isSafeInteger(decoded.id)) {
+          currentUserIdRef.current = decoded.id;
+          setCurrentUserId(decoded.id);
+        }
+      }
+    } catch {
+      // The server remains the authority; this ID is only used to hide our own cursor.
+    }
+    const onConnection = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{ connection: string; pending: number }>
+      ).detail;
+      setConnectionStatus(detail.connection);
+      setPendingSaves(detail.pending);
+    };
+    const onPresence = (event: Event) => {
+      const data = (event as CustomEvent<any>).detail;
+      if (data.userId === currentUserIdRef.current) return;
+      setCollaborators((current) => {
+        if (data.type === "presence:leave" || data.presence?.active === false)
+          return current.filter((user) => user.userId !== data.userId);
+        if (!Number.isFinite(data.userId)) return current;
+        const user = {
+          userId: data.userId,
+          name: String(data.presence?.name ?? `User ${data.userId}`),
+          color: String(data.presence?.color ?? "#818cf8"),
+          ...(Number.isFinite(data.presence?.x) ? { x: data.presence.x } : {}),
+          ...(Number.isFinite(data.presence?.y) ? { y: data.presence.y } : {}),
+        };
+        return [
+          ...current.filter((candidate) => candidate.userId !== user.userId),
+          user,
+        ];
+      });
+    };
+    window.addEventListener("canvas:connection-status", onConnection);
+    window.addEventListener("canvas:remote-presence", onPresence);
+    return () => {
+      window.removeEventListener("canvas:connection-status", onConnection);
+      window.removeEventListener("canvas:remote-presence", onPresence);
+    };
+  }, []);
+
+  // Initialize the engine once. Socket replacement only updates its adapter.
   useEffect(() => {
     const canvas = canvasRef.current;
-    let cancelled = false;
-    if (canvas) {
-      (async () => {
-        if (!socket) return;
-        const controls = await initDraw(
-          // Store the returned controls object
-          canvas,
-          modeRef,
-          strokeColorRef,
-          strokeWidthRef,
-          socket,
-          params,
-          setAiResponse,
-        );
-        if (!cancelled) {
-          cleanupRef.current = controls; // Store the controls object
-        } else {
-          controls.cleanup(); // Call cleanup from the object if cancelled early
+    if (!canvas || !socket || canvasInitStartedRef.current) return;
+    canvasInitStartedRef.current = true;
+    canvasAliveRef.current = true;
+    void initDraw(
+      canvas,
+      modeRef,
+      strokeColorRef,
+      strokeWidthRef,
+      socket,
+      params,
+      setAiResponse,
+    )
+      .then((controls) => {
+        if (!canvasAliveRef.current) {
+          controls.cleanup();
+          return;
         }
-      })();
-    }
-    return () => {
-      cancelled = true;
-      if (cleanupRef.current) {
-        cleanupRef.current.cleanup(); // Call the cleanup function from the object
-        cleanupRef.current = undefined;
-      }
-    };
-  }, [params, socket]);
+        cleanupRef.current = controls;
+        if (latestSocketRef.current !== socket)
+          controls.setSocket(latestSocketRef.current);
+      })
+      .catch(() => {
+        canvasInitStartedRef.current = false;
+        if (canvasAliveRef.current) {
+          setConnectionStatus("reconnecting");
+          window.setTimeout(() => {
+            if (canvasAliveRef.current)
+              setCanvasInitRetry((attempt) => attempt + 1);
+          }, 1000);
+        }
+      });
+  }, [canvasInitRetry, params, socket]);
+
+  useEffect(
+    () => () => {
+      canvasAliveRef.current = false;
+      cleanupRef.current?.cleanup();
+      cleanupRef.current = undefined;
+    },
+    [],
+  );
 
   // Update the eraser cursor position.
   useEffect(() => {
@@ -457,19 +550,12 @@ const Page = ({ params }: Param) => {
     "#00e5ff",
   ];
 
-  async function deleteAllContent() {
-    try {
-      const slug = (await params).slug;
-      const res = await axios.get(`${BACKEND_URL}/api/room/slug/${slug}`);
-      const roomId = res.data.room.id;
-      const delResponse = await axios.delete(
-        `${BACKEND_URL}/api/room/delete/content/${roomId}`,
-      );
-      addNotification("success", delResponse.data.message);
-      cleanupRef.current?.clearLocally();
-    } catch (error: any) {
-      addNotification("error", error.response?.data?.message || "");
+  function deleteAllContent() {
+    if (!cleanupRef.current?.clearCanvas()) {
+      addNotification("error", "Canvas could not be cleared or saved.");
+      return;
     }
+    addNotification("success", "Canvas cleared.");
   }
 
   const minimap = (() => {
@@ -524,6 +610,65 @@ const Page = ({ params }: Param) => {
 
   return (
     <div className="relative">
+      <div className="fixed left-16 top-4 z-40 flex items-center gap-2 rounded-full border border-gray-700 bg-gray-900/90 px-3 py-1.5 text-xs text-gray-200 shadow-lg">
+        <span
+          className={`h-2 w-2 rounded-full ${connectionStatus === "connected" ? "bg-emerald-400" : "bg-amber-400"}`}
+        />
+        <span>
+          {connectionStatus === "connected" ? "Connected" : "Reconnecting"}
+        </span>
+        <span className="text-gray-400">
+          {pendingSaves ? `Saving ${pendingSaves}` : "Saved"}
+        </span>
+        {collaborators
+          .filter((user) => user.userId !== currentUserId)
+          .map((user) => (
+            <span
+              key={user.userId}
+              title={user.name}
+              className="flex h-6 w-6 items-center justify-center rounded-full font-semibold text-black"
+              style={{ backgroundColor: user.color }}
+            >
+              {user.name.slice(0, 1).toUpperCase()}
+            </span>
+          ))}
+      </div>
+      {collaborators
+        .filter((user) => user.userId !== currentUserId)
+        .filter((user) => user.x !== undefined && user.y !== undefined)
+        .map((user) => {
+          const bounds = canvasRef.current?.getBoundingClientRect();
+          if (!bounds || !viewport) return null;
+          const x = bounds.left + viewport.offsetX + user.x! * viewport.zoom;
+          const y = bounds.top + viewport.offsetY + user.y! * viewport.zoom;
+          return (
+            <div
+              key={`cursor-${user.userId}`}
+              className="pointer-events-none fixed z-30"
+              style={{ left: x, top: y, color: user.color }}
+            >
+              <svg
+                width="18"
+                height="22"
+                viewBox="0 0 18 22"
+                aria-hidden="true"
+              >
+                <path
+                  d="M1 1v17l5-5 3 7 3-1-3-7h7L1 1Z"
+                  fill={user.color}
+                  stroke="white"
+                  strokeWidth="1.2"
+                />
+              </svg>
+              <span
+                className="ml-3 rounded px-1.5 py-0.5 text-[11px] text-white"
+                style={{ backgroundColor: user.color }}
+              >
+                {user.name}
+              </span>
+            </div>
+          );
+        })}
       {/* AI Response Overlay at Bottom Right */}
       {aiResponse && (
         <div className="fixed right-0 bottom-0 z-50 bg-gray-800 p-6 rounded-lg shadow-lg max-w-md w-full m-4">
@@ -596,7 +741,19 @@ const Page = ({ params }: Param) => {
             <button
               title="Reset zoom to 100%"
               className="min-w-12 px-1 text-sm tabular-nums hover:text-white"
-              onClick={() => cleanupRef.current?.setZoom(1)}
+              onClick={() => {
+                const collaborator = collaborators.find(
+                  (user) =>
+                    user.userId !== currentUserId &&
+                    user.x !== undefined &&
+                    user.y !== undefined,
+                );
+                cleanupRef.current?.resetView(
+                  collaborator
+                    ? { x: collaborator.x!, y: collaborator.y! }
+                    : undefined,
+                );
+              }}
             >
               {Math.round((viewport?.zoom ?? 1) * 100)}%
             </button>
@@ -643,13 +800,6 @@ const Page = ({ params }: Param) => {
         >
           <div>{runningAi ? "Solving..." : "Solve"}</div>
           {!runningAi && <Play size={14} />}
-        </button>
-        <button
-          onClick={() => deleteAllContent()}
-          className="font-bold px-3 py-1 gap-1 flex items-center rounded-full  bg-gray-800 border border-gray-700 shadow-md  text-gray-300 hover:bg-indigo-600 hover:text-white transition-colors duration-200"
-        >
-          <div>Clear</div>
-          <Trash size={18} />
         </button>
         <button
           onClick={() => router.push("/Dashboard")}
@@ -795,6 +945,17 @@ const Page = ({ params }: Param) => {
               </button>
             ))}
           </div>
+          {(roomRole === "OWNER" ||
+            (roomOwnerId !== null && roomOwnerId === currentUserId)) && (
+            <button
+              type="button"
+              onClick={deleteAllContent}
+              className="mt-4 flex w-full items-center justify-center gap-2 rounded border border-red-700/70 bg-red-950/60 px-3 py-2 text-sm text-red-200 hover:bg-red-900"
+            >
+              <Trash size={16} />
+              Clear canvas
+            </button>
+          )}
         </div>
       )}
 

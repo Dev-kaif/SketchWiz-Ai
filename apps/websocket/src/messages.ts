@@ -73,6 +73,11 @@ function throttleEphemeral(connection: Connection, roomId: number) {
   return true;
 }
 
+function cursorColor(userId: number) {
+  const hue = (userId * 137.508) % 360;
+  return `hsl(${hue.toFixed(0)} 78% 62%)`;
+}
+
 export async function handleMessage(
   connection: Connection,
   memberships: RoomMembership,
@@ -86,6 +91,10 @@ export async function handleMessage(
     const role = await joinPublicRoom(message.roomId, connection.userId);
     if (!role) {
       memberships.leave(connection, message.roomId);
+      send(connection.socket, {
+        type: "room:access-denied",
+        roomId: message.roomId,
+      });
       return;
     }
     memberships.join(connection, message.roomId);
@@ -96,7 +105,29 @@ export async function handleMessage(
     memberships.leave(connection, message.roomId);
     return;
   }
-  if (!connection.rooms.has(message.roomId)) return;
+  if (!connection.rooms.has(message.roomId)) {
+    if (message.type === "canvas:batch")
+      send(connection.socket, {
+        type: "canvas:ack",
+        roomId: message.roomId,
+        error: "room_access_denied",
+        operationIds: message.operations.map(({ operationId }) => ({
+          operationId,
+        })),
+      });
+    else if (
+      message.type === "canvas:create" ||
+      message.type === "canvas:update" ||
+      message.type === "canvas:delete"
+    )
+      send(connection.socket, {
+        type: "canvas:ack",
+        roomId: message.roomId,
+        error: "room_access_denied",
+        operationIds: [{ operationId: message.operationId }],
+      });
+    return;
+  }
 
   const activeUserIds = connectedUserIds(
     memberships,
@@ -123,7 +154,15 @@ export async function handleMessage(
   }
 
   if (message.type === "canvas:preview" || message.type === "presence:update") {
-    if (!throttleEphemeral(connection, message.roomId)) return;
+    if (
+      !throttleEphemeral(connection, message.roomId) &&
+      !(
+        (message.type === "presence:update" &&
+          message.presence.active === false) ||
+        (message.type === "canvas:preview" && message.preview.active === false)
+      )
+    )
+      return;
     const roles = await currentRoomRoles(message.roomId, activeUserIds);
     const role = roles.get(connection.userId);
     if (!role) {
@@ -143,7 +182,12 @@ export async function handleMessage(
         : {
             type: message.type,
             roomId: message.roomId,
-            presence: message.presence,
+            presence: {
+              ...message.presence,
+              active: message.presence.active !== false,
+              name: connection.displayName,
+              color: cursorColor(connection.userId),
+            },
             userId: connection.userId,
           };
     broadcast(
@@ -152,6 +196,8 @@ export async function handleMessage(
       payload,
       roles,
       new Set(activeUserIds),
+      connection.socket,
+      connection.userId,
     );
     return;
   }
@@ -247,18 +293,18 @@ export async function handleMessage(
     userId: connection.userId,
     activeUserIds,
     mutations,
+    requireOwner: message.type === "canvas:batch" && message.clear === true,
     expectedRevision:
       message.type === "canvas:batch" ? message.expectedRevision : undefined,
   });
   if (!persisted.allowed) {
     if (!persisted.role) memberships.leave(connection, message.roomId);
-    if (persisted.conflict) {
-      send(connection.socket, {
-        type: "canvas:ack",
-        roomId: message.roomId,
-        error: "operation_conflict",
-      });
-    }
+    send(connection.socket, {
+      type: "canvas:ack",
+      roomId: message.roomId,
+      error: persisted.conflict ? "operation_conflict" : "operation_rejected",
+      operationIds: mutations.map(({ operationId }) => ({ operationId })),
+    });
     return;
   }
 
