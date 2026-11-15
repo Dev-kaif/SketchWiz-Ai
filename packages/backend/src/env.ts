@@ -5,7 +5,7 @@ const shared = z.object({
   DATABASE_URL: z.string().url().optional(),
   JWT_SECRET: z
     .string()
-    .min(12, "JWT_SECRET must be at least 12 characters")
+    .min(6, "JWT_SECRET must be at least 6 characters")
     .optional(),
   GEMINI_API_KEY: z.string().min(1).optional(),
   NODE_ENV: z
