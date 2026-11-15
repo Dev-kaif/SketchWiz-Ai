@@ -1,1 +1,1 @@
-{"root":["./src/auth.ts","./src/index.ts"],"version":"5.7.3"}
+{"root":["./src/app.ts","./src/errors.ts","./src/index.ts","./src/middleware/auth.ts","./src/middleware/errors.ts","./src/modules/ai/routes.ts","./src/modules/auth/controller.ts","./src/modules/auth/routes.ts","./src/modules/auth/service.ts","./src/modules/rooms/routes.ts"],"version":"6.0.3"}

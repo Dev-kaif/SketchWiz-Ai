@@ -1,3 +1,12 @@
 packages:
   - "apps/*"
   - "packages/*"
+verifyDepsBeforeRun: false
+allowBuilds:
+  "@prisma/engines": true
+  bcrypt: true
+  esbuild: true
+  onnxruntime-node: true
+  prisma: true
+  protobufjs: true
+  sharp: true

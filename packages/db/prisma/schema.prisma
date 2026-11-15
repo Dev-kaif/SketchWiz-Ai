@@ -5,32 +5,38 @@
 // Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
 
 generator client {
-  provider = "prisma-client-js"
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 model User {
-  id       Int    @id @default(autoincrement())
-  email    String @unique
-  username String @unique
-  password String
-  name     String
-  photo    String?
-  room     Room[]
-  Chat     Chat[]
+  id          Int               @id @default(autoincrement())
+  email       String            @unique
+  username    String            @unique
+  password    String
+  name        String
+  photo       String?
+  room        Room[]
+  Chat        Chat[]
+  memberships RoomMember[]
+  assets      Asset[]
+  operations  CanvasOperation[]
 }
 
 model Room {
-  id        Int      @id @default(autoincrement())
-  slug      String   @unique
-  createdAt DateTime @default(now())
-  adminId   Int
-  admin     User     @relation(fields: [adminId], references: [id])
-  Chat      Chat[]
+  id         Int            @id @default(autoincrement())
+  slug       String         @unique
+  createdAt  DateTime       @default(now())
+  adminId    Int
+  visibility RoomVisibility @default(PRIVATE)
+  admin      User           @relation(fields: [adminId], references: [id])
+  Chat       Chat[]
+  members    RoomMember[]
+  canvas     Canvas?
 }
 
 model Chat {
@@ -40,4 +46,93 @@ model Chat {
   roomId  Int
   room    Room   @relation(fields: [roomId], references: [id])
   user    User   @relation(fields: [userId], references: [id])
+
+  @@index([roomId, id])
+}
+
+enum RoomRole {
+  OWNER
+  EDITOR
+  VIEWER
+}
+
+enum RoomVisibility {
+  PRIVATE
+  PUBLIC
+}
+
+model RoomMember {
+  id        Int      @id @default(autoincrement())
+  roomId    Int
+  userId    Int
+  role      RoomRole @default(EDITOR)
+  createdAt DateTime @default(now())
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([roomId, userId])
+  @@index([userId, roomId])
+}
+
+model Canvas {
+  id         Int               @id @default(autoincrement())
+  roomId     Int               @unique
+  revision   BigInt            @default(0)
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+  room       Room              @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  elements   CanvasElement[]
+  operations CanvasOperation[]
+  snapshots  CanvasSnapshot[]
+}
+
+model CanvasElement {
+  id         String   @id
+  canvasId   Int
+  revision   BigInt
+  properties Json     @db.JsonB
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  canvas     Canvas   @relation(fields: [canvasId], references: [id], onDelete: Cascade)
+
+  @@unique([canvasId, revision])
+}
+
+model CanvasOperation {
+  id          Int      @id @default(autoincrement())
+  operationId String   @unique
+  canvasId    Int
+  revision    BigInt
+  actorId     Int
+  kind        String
+  payload     Json     @db.JsonB
+  createdAt   DateTime @default(now())
+  canvas      Canvas   @relation(fields: [canvasId], references: [id], onDelete: Cascade)
+  actor       User     @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@unique([canvasId, revision])
+}
+
+model CanvasSnapshot {
+  id        Int      @id @default(autoincrement())
+  canvasId  Int
+  revision  BigInt
+  state     Json     @db.JsonB
+  createdAt DateTime @default(now())
+  canvas    Canvas   @relation(fields: [canvasId], references: [id], onDelete: Cascade)
+
+  @@unique([canvasId, revision])
+}
+
+model Asset {
+  id          String   @id @default(cuid())
+  ownerId     Int
+  storageKey  String   @unique
+  contentType String
+  sizeBytes   BigInt
+  checksum    String?
+  createdAt   DateTime @default(now())
+  owner       User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId, createdAt])
 }

@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:latest
+    environment:
+      POSTGRES_DB: sketchwiz
+      POSTGRES_USER: sketchwiz
+      POSTGRES_PASSWORD: local-only-password
+    ports:
+      - "127.0.0.1:55432:5432"
+    tmpfs:
+      - /var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sketchwiz -d sketchwiz"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
