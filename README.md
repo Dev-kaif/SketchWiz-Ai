@@ -354,7 +354,7 @@ Client message types:
 | `chat`       | `roomId`, `message` | Owner/editor role is checked and locked in the persistence transaction. It stores the legacy chat row and, for supported shapes, updates canvas state and creates an operation record; then it broadcasts to current members. |
 | `ai`         | `roomId`, `message` | Requires current membership, then broadcasts `{ type, message, roomId }` to active room members, including the sender. It does not persist the message.                                                                       |
 
-Room connection sets exist in process memory; authorization is stored in PostgreSQL. There is no acknowledgement/error protocol, so rejected joins and unauthorized writes are silently ignored to preserve the current wire protocol. Messages are limited by the configured payload and per-user rate ceilings. Malformed messages and asynchronous handler errors are handled without crashing the process. Drawing payloads are not logged.
+Room connection sets exist in process memory; authorization is stored in PostgreSQL. Each event checks the sender and active recipients in one database membership query; drawing authorization is row-locked in the same transaction as its durable writes. Fan-out uses one serialized frame for all recipients. Per-connection events run in order; excess queued input closes that socket with code `1013`. Native ping/pong checks run every 30 seconds, and a slow recipient is closed when its outgoing buffer exceeds 1 MiB. There is no acknowledgement/error protocol, so rejected joins and unauthorized writes are silently ignored to preserve the wire contract. Malformed messages and asynchronous handler errors do not crash the process. Drawing payloads are not logged.
 
 ### Backend functions and middleware
 
@@ -454,7 +454,7 @@ Rollback: stop the new app version and restore the pre-migration database backup
 - Room slug has an existing unique index; chat history lookup uses `roomId`, and now requests rows in ID order with a bounded page of 2,000 rows. The legacy API does not yet expose a cursor, so very large history needs a follow-up compatible paging contract.
 - Canvas state has a unique room key; element, operation, and snapshot access are indexed by canvas and revision/time. Operation IDs are unique for duplicate prevention.
 - Image uploads are held in memory and limited to 10 MiB. AI requests are synchronous from the HTTP caller's perspective and can consume substantial memory/latency. Large-scale jobs/queues are not introduced.
-- WebSocket connection membership uses room-indexed sets. Drawing messages recheck and lock the sender's membership in the persistence transaction. Broadcast fan-out performs one indexed membership query for current recipients, so a removed member is removed from the local room before receiving the next event. This adds database work to each event; no performance gain is claimed or measured here.
+- WebSocket connection membership uses room-indexed sets. Each drawing event performs one indexed membership query for the sender and current recipients, down from separate sender and fan-out queries. The fan-out query is not repeated per recipient. This still adds one database membership query to each event; no performance gain is claimed or measured here.
 - HTTP AI limits and WebSocket message limits use bounded in-memory fixed-window counters. They protect one service process; replicas have independent counters.
 
 #### Batch 02 security implementation

@@ -1,9 +1,18 @@
 import type WebSocket from "ws";
+import type { RawData } from "ws";
+import type { RoomRole } from "@repo/db/access";
+export type QueuedMessage = { raw: RawData; bytes: number };
 export type Connection = {
   socket: WebSocket;
   userId: number;
   rooms: Set<number>;
-  roles: Map<number, "OWNER" | "EDITOR" | "VIEWER">;
+  roles: Map<number, RoomRole>;
+  queue: QueuedMessage[];
+  queuedBytes: number;
+  processing: boolean;
+  closingForBackpressure: boolean;
+  closeCode?: number;
+  closeReason?: string;
 };
 export class RoomMembership {
   private members = new Map<number, Set<Connection>>();
