@@ -1,6 +1,6 @@
 import bcrypt from "bcrypt";
-import jwt from "jsonwebtoken";
 import { client } from "@repo/db/client";
+import { signAccessToken } from "@repo/backend/config";
 import { serverEnv } from "@repo/backend/env";
 import { AppError } from "../../errors.js";
 
@@ -11,7 +11,7 @@ export async function signup(input: {
   password: string;
   photo?: string;
 }) {
-  const password = await bcrypt.hash(input.password, 10);
+  const password = await bcrypt.hash(input.password, 12);
   try {
     await client.user.create({
       data: { ...input, password, photo: input.photo || null },
@@ -38,5 +38,5 @@ export async function signin(email: string, password: string) {
   });
   if (!user || !(await bcrypt.compare(password, user.password)))
     throw new AppError(401, "Invalid credentials", "INVALID_CREDENTIALS");
-  return jwt.sign({ id: user.id }, serverEnv().JWT_SECRET);
+  return signAccessToken(user.id, serverEnv().JWT_SECRET);
 }

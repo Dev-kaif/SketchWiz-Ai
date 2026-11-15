@@ -3,6 +3,7 @@ export type Connection = {
   socket: WebSocket;
   userId: number;
   rooms: Set<number>;
+  roles: Map<number, "OWNER" | "EDITOR" | "VIEWER">;
 };
 export class RoomMembership {
   private members = new Map<number, Set<Connection>>();
@@ -17,6 +18,7 @@ export class RoomMembership {
   }
   leave(connection: Connection, roomId: number) {
     connection.rooms.delete(roomId);
+    connection.roles.delete(roomId);
     const group = this.members.get(roomId);
     group?.delete(connection);
     if (group?.size === 0) this.members.delete(roomId);

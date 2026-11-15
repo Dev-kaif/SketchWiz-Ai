@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createApp } from "../dist/app.js";
 import { client } from "@repo/db/client";
+import jwt from "jsonwebtoken";
 
 let httpServer;
 let baseUrl;
@@ -10,6 +11,7 @@ let email;
 let userId;
 let roomId;
 let token;
+let outsider;
 
 before(async () => {
   await client.$connect();
@@ -24,6 +26,8 @@ after(async () => {
     await client.room.delete({ where: { id: roomId } }).catch(() => {});
   if (userId)
     await client.user.delete({ where: { id: userId } }).catch(() => {});
+  if (outsider)
+    await client.user.delete({ where: { id: outsider.id } }).catch(() => {});
   if (httpServer) await new Promise((resolve) => httpServer.close(resolve));
   await client.$disconnect();
 });
@@ -55,6 +59,23 @@ test("signup, signin, protected room APIs and content clearing retain API contra
     authorization: `Bearer ${token}`,
     "content-type": "application/json",
   };
+
+  const unauthenticatedAi = await fetch(`${baseUrl}/api/analyze/ai`, {
+    method: "POST",
+  });
+  assert.equal(unauthenticatedAi.status, 401);
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const missingImage = await fetch(`${baseUrl}/api/analyze/ai`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(missingImage.status, 400);
+  }
+  const limitedAi = await fetch(`${baseUrl}/api/analyze/ai`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}` },
+  });
+  assert.equal(limitedAi.status, 429);
 
   const created = await fetch(`${baseUrl}/api/room`, {
     method: "POST",
@@ -138,4 +159,68 @@ test("signup, signin, protected room APIs and content clearing retain API contra
   );
   const unauthorized = await fetch(`${baseUrl}/api/rooms`);
   assert.equal(unauthorized.status, 401);
+
+  outsider = await client.user.create({
+    data: {
+      email: `outsider-${Date.now()}@example.test`,
+      username: `outsider${Date.now()}`,
+      name: "Room outsider",
+      password: "test-hash",
+    },
+  });
+  const outsiderHeaders = {
+    authorization: `Bearer ${jwt.sign({ id: outsider.id }, process.env.JWT_SECRET)}`,
+  };
+  const makePrivate = await fetch(`${baseUrl}/api/room/${roomId}/visibility`, {
+    method: "PATCH",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({ visibility: "PRIVATE" }),
+  });
+  assert.equal(makePrivate.status, 200);
+  const deniedSlug = await fetch(
+    `${baseUrl}/api/room/slug/${roomBody.room.slug}`,
+    {
+      headers: outsiderHeaders,
+    },
+  );
+  assert.equal(deniedSlug.status, 404);
+  const deniedHistory = await fetch(`${baseUrl}/api/room/${roomId}`, {
+    headers: outsiderHeaders,
+  });
+  assert.equal(deniedHistory.status, 404);
+  const deniedClear = await fetch(
+    `${baseUrl}/api/room/delete/content/${roomId}`,
+    { method: "DELETE", headers: outsiderHeaders },
+  );
+  assert.equal(deniedClear.status, 404);
+  const deniedDelete = await fetch(`${baseUrl}/api/room/delete/${roomId}`, {
+    method: "DELETE",
+    headers: outsiderHeaders,
+  });
+  assert.equal(deniedDelete.status, 404);
+
+  const addedViewer = await fetch(`${baseUrl}/api/room/${roomId}/members`, {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({ userId: outsider.id, role: "VIEWER" }),
+  });
+  assert.equal(addedViewer.status, 200);
+  assert.equal((await addedViewer.json()).member.role, "VIEWER");
+  const viewerClear = await fetch(
+    `${baseUrl}/api/room/delete/content/${roomId}`,
+    { method: "DELETE", headers: outsiderHeaders },
+  );
+  assert.equal(viewerClear.status, 403);
+  const allowedHistory = await fetch(`${baseUrl}/api/room/${roomId}`, {
+    headers: outsiderHeaders,
+  });
+  assert.equal(allowedHistory.status, 200);
+  const removeViewer = await fetch(
+    `${baseUrl}/api/room/${roomId}/members/${outsider.id}`,
+    {
+      method: "DELETE",
+      headers: outsiderHeaders,
+    },
+  );
+  assert.equal(removeViewer.status, 403);
 });

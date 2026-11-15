@@ -7,6 +7,7 @@ import { createWebSocketServer } from "../dist/server.js";
 import { client } from "@repo/db/client";
 
 let user;
+let outsider;
 let rooms = [];
 let wss;
 let sockets = [];
@@ -48,6 +49,14 @@ before(async () => {
         },
       }),
     );
+  outsider = await client.user.create({
+    data: {
+      email: `ws-outsider-${Date.now()}@example.test`,
+      username: `wsout${Date.now()}`,
+      name: "WS outsider",
+      password: "hash",
+    },
+  });
   wss = createWebSocketServer({ host: "127.0.0.1", port: 0 });
   await once(wss, "listening");
   endpoint = `ws://127.0.0.1:${wss.address().port}`;
@@ -62,6 +71,8 @@ after(async () => {
   }
   if (user)
     await client.user.delete({ where: { id: user.id } }).catch(() => {});
+  if (outsider)
+    await client.user.delete({ where: { id: outsider.id } }).catch(() => {});
   await client.$disconnect();
 });
 
@@ -140,4 +151,87 @@ test("auth, room isolation, safe parsing and serialized concurrent drawing write
     await client.chat.count({ where: { roomId: rooms[0].id } }),
     concurrentCount + 1,
   );
+});
+
+test("a signed-in nonmember cannot join a private room or inject drawing events", async () => {
+  const token = jwt.sign({ id: outsider.id }, process.env.JWT_SECRET);
+  const socket = await connect(token);
+  const before = await client.chat.count({ where: { roomId: rooms[0].id } });
+  const canvas = await client.canvas.findUnique({
+    where: { roomId: rooms[0].id },
+  });
+  const operationsBefore = await client.canvasOperation.count({
+    where: { canvasId: canvas.id },
+  });
+  socket.send(JSON.stringify({ type: "join_room", roomId: rooms[0].id }));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  socket.send(
+    JSON.stringify({
+      type: "chat",
+      roomId: rooms[0].id,
+      message: {
+        id: "unauthorized-shape",
+        type: "line",
+        x1: 0,
+        y1: 0,
+        x2: 1,
+        y2: 1,
+      },
+    }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(
+    await client.chat.count({ where: { roomId: rooms[0].id } }),
+    before,
+  );
+  assert.equal(
+    await client.canvasOperation.count({ where: { canvasId: canvas.id } }),
+    operationsBefore,
+  );
+
+  await client.roomMember.create({
+    data: { roomId: rooms[0].id, userId: outsider.id, role: "VIEWER" },
+  });
+  socket.send(JSON.stringify({ type: "join_room", roomId: rooms[0].id }));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  socket.send(
+    JSON.stringify({
+      type: "chat",
+      roomId: rooms[0].id,
+      message: { id: "viewer-shape", type: "line", x1: 0, y1: 0, x2: 1, y2: 1 },
+    }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(
+    await client.chat.count({ where: { roomId: rooms[0].id } }),
+    before,
+  );
+  assert.equal(
+    await client.canvasOperation.count({ where: { canvasId: canvas.id } }),
+    operationsBefore,
+  );
+  await client.roomMember.delete({
+    where: { roomId_userId: { roomId: rooms[0].id, userId: outsider.id } },
+  });
+  const ownerSocket = await connect(
+    jwt.sign({ id: user.id }, process.env.JWT_SECRET),
+  );
+  ownerSocket.send(JSON.stringify({ type: "join_room", roomId: rooms[0].id }));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  const noRevokedMemberLeak = nextMessage(socket, 150);
+  ownerSocket.send(
+    JSON.stringify({
+      type: "chat",
+      roomId: rooms[0].id,
+      message: {
+        id: "private-after-removal",
+        type: "line",
+        x1: 0,
+        y1: 0,
+        x2: 1,
+        y2: 1,
+      },
+    }),
+  );
+  await assert.rejects(noRevokedMemberLeak, /timeout/);
 });

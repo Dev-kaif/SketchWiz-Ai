@@ -171,15 +171,19 @@ This section documents the backend implemented in `apps/server` and the realtime
 
 Set these on the service that uses them:
 
-| Variable         | Used by                           | Purpose                                                                          |
-| ---------------- | --------------------------------- | -------------------------------------------------------------------------------- |
-| `DATABASE_URL`   | HTTP server and WebSocket service | PostgreSQL connection string used by Prisma.                                     |
-| `JWT_SECRET`     | HTTP server and WebSocket service | Signs and verifies authentication tokens. Both services must use the same value. |
-| `GEMINI_API_KEY` | HTTP server                       | Authenticates Gemini API calls.                                                  |
-| `PORT`           | Each deployed service             | Railway-provided port; defaults to `5000` (HTTP) or `8000` (WebSocket).          |
-| `HOST`           | Each service                      | Listen host; defaults to `0.0.0.0`.                                              |
-| `CORS_ORIGINS`   | HTTP server                       | Comma-separated allowed origins; defaults to `*` for compatibility.              |
-| `NODE_ENV`       | Each service                      | `development`, `test`, or `production`; defaults to `development`.               |
+| Variable                                              | Used by                           | Purpose                                                                                |
+| ----------------------------------------------------- | --------------------------------- | -------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                                        | HTTP server and WebSocket service | PostgreSQL connection string used by Prisma.                                           |
+| `JWT_SECRET`                                          | HTTP server and WebSocket service | Signs and verifies authentication tokens. Both services must use the same value.       |
+| `GEMINI_API_KEY`                                      | HTTP server                       | Authenticates Gemini API calls.                                                        |
+| `PORT`                                                | Each deployed service             | Railway-provided port; defaults to `5000` (HTTP) or `8000` (WebSocket).                |
+| `HOST`                                                | Each service                      | Listen host; defaults to `0.0.0.0`.                                                    |
+| `CORS_ORIGINS`                                        | HTTP server                       | Comma-separated trusted browser origins; wildcard is accepted only outside production. |
+| `AI_RATE_LIMIT` / `AI_RATE_WINDOW_MS`                 | HTTP server                       | Per-user AI request limit; defaults to 10 requests per 60 seconds.                     |
+| `AI_MAX_CONCURRENT_PER_USER`                          | HTTP server                       | Maximum simultaneous AI requests per user; defaults to 2.                              |
+| `WS_MAX_PAYLOAD_BYTES`                                | WebSocket service                 | Maximum WebSocket message size; defaults to 20 MiB.                                    |
+| `WS_MESSAGE_RATE_LIMIT` / `WS_MESSAGE_RATE_WINDOW_MS` | WebSocket service                 | Per-user message ceiling; defaults to 500 messages per 10 seconds.                     |
+| `NODE_ENV`                                            | Each service                      | `development`, `test`, or `production`; defaults to `development`.                     |
 
 The web app also needs `NEXT_PUBLIC_BACKEND_URL` and `NEXT_PUBLIC_WS_URL` at build time; those are frontend settings, not server secrets. Set `CORS_ORIGINS` to the deployed frontend origin in production.
 
@@ -191,7 +195,7 @@ The web app also needs `NEXT_PUBLIC_BACKEND_URL` and `NEXT_PUBLIC_WS_URL` at bui
 Authorization: eyJhbGciOi...
 ```
 
-The WebSocket client passes the same token as the `token` query parameter. Tokens are signed without an explicit expiry in the current implementation.
+The WebSocket client passes the same token as the `token` query parameter. New tokens use HS256 and expire after seven days. Signed tokens from the previous implementation are accepted for up to seven days from their issue time; expired, malformed, tampered, or invalid-identity tokens are rejected. The same `JWT_SECRET` must be configured for both backend services.
 
 ### HTTP endpoints
 
@@ -219,7 +223,7 @@ Request JSON:
 }
 ```
 
-`photo` is optional. The Zod schema requires a valid email, username and name of 3–30 characters, and a password of at least 8 characters. The password is hashed with bcrypt using 10 salt rounds before storage. The API does not return the created user.
+`photo` is optional. The Zod schema requires a valid email, username and name of 3–30 characters, and a password of at least 8 characters. The password is hashed with bcrypt using 12 salt rounds before storage. The API does not return the created user.
 
 - `201`: `{ "message": "User created successfully" }`
 - `400`: invalid input, with Zod details in `errors`.
@@ -236,7 +240,7 @@ Request JSON:
 { "email": "person@example.com", "password": "at-least-8-characters" }
 ```
 
-The API validates input, looks up the user by email, compares the password with bcrypt, and signs a JWT containing `{ "id": user.id }` using `JWT_SECRET`.
+The API validates input, looks up the user by email, compares the password with bcrypt, and signs a seven-day JWT containing the numeric user ID using `JWT_SECRET`. Sign-in and sign-up share a per-IP limit of 20 attempts per minute.
 
 - `200`: `{ "message": "Signin successful", "token": "..." }`
 - `400`: invalid input, with Zod details in `errors`.
@@ -254,6 +258,28 @@ Creates a room owned by the authenticated user. The request body is `{ "roomName
 
 #### `GET /api/rooms` (protected)
 
+Lists rooms owned by or joined by the authenticated user.
+
+#### Room access and membership (protected)
+
+Rooms have `OWNER`, `EDITOR`, and `VIEWER` memberships. Owners can change visibility, add existing users by ID as editors/viewers, remove non-owner members, clear a room, and delete a room. Editors can read and draw. Viewers can read and receive room updates but cannot submit drawing mutations. Private room lookups return `404` for nonmembers so room existence is not revealed.
+
+New rooms are public to authenticated SketchWiz users for compatibility with the current share-by-slug client flow. The first authenticated request to a public room's slug creates an editor membership; no anonymous room access is granted. Owners can make a room private with:
+
+```http
+PATCH /api/room/:roomId/visibility
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{ "visibility": "PRIVATE" }
+```
+
+Add an existing user with `POST /api/room/:roomId/members` and `{ "userId": 123, "role": "VIEWER" }`. Remove a non-owner with `DELETE /api/room/:roomId/members/:userId`. The existing frontend contract remains unchanged; room IDs/slugs that the old API exposed to every signed-in user are now protected by membership and visibility.
+
+#### AI routes (protected)
+
+`POST /api/analyze/ai` returns `{ "analysisResult": [...] }`; `POST /api/improve/ai` returns generated image bytes with an image content type. Both require an authenticated user and a PNG, JPEG, or WebP `image` upload up to 10 MiB. If a multipart `roomId` is supplied, it must be a room member. Calls have a per-user request limit, concurrency ceiling, and 60-second provider timeout. Current frontend calls omit `roomId`, so these calls are authenticated and rate-limited but cannot be associated with a specific room.
+
 Lists rooms whose `adminId` matches the authenticated user. This is not a list of every room the user may have joined.
 
 - `200`: `{ "rooms": [ ... ] }`
@@ -262,7 +288,7 @@ Lists rooms whose `adminId` matches the authenticated user. This is not a list o
 
 #### `GET /api/room/:roomId` (protected)
 
-Returns up to 2,000 persisted chat rows in ID order for the numeric room ID as `{ "messages": [ ... ] }`. It does not currently check that the caller belongs to the room or owns it.
+Returns up to 2,000 persisted chat rows in ID order for the numeric room ID as `{ "messages": [ ... ] }`. The caller must be an owner, editor, or viewer member.
 
 - `200`: `{ "messages": [ ... ] }`
 - `500`: database errors return a safe generic error response.
@@ -270,43 +296,50 @@ Returns up to 2,000 persisted chat rows in ID order for the numeric room ID as `
 
 #### `GET /api/room/slug/:slug` (protected)
 
-Looks up one room by its slug and returns `{ "room": roomOrNull }`. It does not currently check room membership or ownership.
+Looks up one room by its slug and returns `{ "room": room }`. Existing members can access private rooms; authenticated users can join public rooms as editors.
 
-- `200`: room object or `null` in `room`.
+- `200`: `{ "room": room }`.
+- `404`: room does not exist or is private to another user.
 - `500`: database errors return a safe generic error response.
 - `401`: missing, invalid, or expired token.
 
 #### `DELETE /api/room/delete/:roomId` (protected)
 
-Deletes all chat rows for a room and then deletes the room in a Prisma transaction. The current implementation does not check that the authenticated user owns the room.
+Deletes all chat rows for a room and then deletes the room in a Prisma transaction. Only an owner can delete it.
 
 - `200`: success message and deleted `room` object.
 - `500`: deletion or database error.
 - `401`: missing, invalid, or expired token.
+- `403` or `404`: caller is not the room owner or the room is private to another user.
 
 #### `DELETE /api/room/delete/content/:roomId` (protected)
 
-Deletes chat, canvas element, operation, and snapshot rows for the specified room, leaving the room and its revision in place. The current implementation does not check ownership or membership.
+Deletes chat, canvas element, operation, and snapshot rows for the specified room, leaving the room in place and incrementing its revision. Only an owner can clear it.
 
 - `200`: `{ "message": "Content deleted successfully.", "response": { ...deleteMany count... } }`
 - `500`: deletion or database error.
 - `401`: missing, invalid, or expired token.
+- `403` or `404`: caller is not the room owner or the room is private to another user.
 
-#### `POST /api/analyze/ai` (multipart image upload)
+#### `POST /api/analyze/ai` (protected multipart image upload)
 
-Accepts `multipart/form-data` with an `image` file (maximum 10 MiB). The route sends it to Gemini for visual interpretation, then returns `{ "analysisResult": [...] }`. It uses `gemini-3.8-flash`, parses the model response as JSON, and returns a cleaned response if parsing fails. Although a `dictOfVars` field is mentioned in the prompt, it is not read from the request. The endpoint does not currently require authentication.
+Accepts `multipart/form-data` with a valid PNG, JPEG, or WebP `image` file (maximum 10 MiB). The route sends it to Gemini for visual interpretation, then returns `{ "analysisResult": [...] }`. It uses `gemini-3.8-flash`, parses the model response as JSON, and returns a cleaned response if parsing fails. A supplied `roomId` must belong to the authenticated user.
 
 - `200`: `{ "analysisResult": [...] }`.
 - `400`: `{ "error": "No image provided" }`.
-- `500`: `{ "error": "Internal Server Error" }` if Gemini or processing fails.
+- `401`: missing or invalid token.
+- `429`: per-user AI request limit exceeded.
+- `502`: sanitized provider failure.
 
-#### `POST /api/improve/ai` (multipart image upload)
+#### `POST /api/improve/ai` (protected multipart image upload)
 
-Accepts `multipart/form-data` with an `image` file (maximum 10 MiB). It asks Gemini to generate a more detailed prompt, then uses `gemini-3.1-flash-image` for an enhanced sketch. On success it returns image bytes with `Content-Type: image/png`. This endpoint does not currently require authentication.
+Accepts `multipart/form-data` with a valid PNG, JPEG, or WebP `image` file (maximum 10 MiB). It asks Gemini to generate a more detailed prompt, then uses `gemini-3.1-flash-image` for an enhanced sketch. On success it returns image bytes with an image content type. A supplied `roomId` must belong to the authenticated user.
 
 - `200`: PNG image bytes.
 - `400`: `{ "error": "No image provided" }`.
-- `500`: `{ "error": "Internal Server Error" }` if AI generation or processing fails.
+- `401`: missing or invalid token.
+- `429`: per-user AI request or concurrency limit exceeded.
+- `502`: sanitized provider failure.
 
 ### WebSocket protocol
 
@@ -314,14 +347,14 @@ Connect to `ws://<host>:8000/?token=<JWT>` locally, or `wss://.../?token=<JWT>` 
 
 Client message types:
 
-| Type         | Required fields     | Behavior                                                                                                                                                                                             |
-| ------------ | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `join_room`  | `roomId` number     | Adds this connection to the in-memory membership list for that room.                                                                                                                                 |
-| `leave_room` | `roomId` number     | Removes this connection from that room.                                                                                                                                                              |
-| `chat`       | `roomId`, `message` | In one transaction stores the legacy chat row and, for shape payloads, updates canvas state and creates an operation record. Then broadcasts `{ type, message, roomId }` to other connected members. |
-| `ai`         | `roomId`, `message` | Broadcasts `{ type, message, roomId }` to all connected room members, including the sender. It does not persist the message.                                                                         |
+| Type         | Required fields     | Behavior                                                                                                                                                                                                                      |
+| ------------ | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `join_room`  | `roomId` number     | Adds this connection to the in-memory room only after database membership or public-room access is confirmed.                                                                                                                 |
+| `leave_room` | `roomId` number     | Removes this connection from that room.                                                                                                                                                                                       |
+| `chat`       | `roomId`, `message` | Owner/editor role is checked and locked in the persistence transaction. It stores the legacy chat row and, for supported shapes, updates canvas state and creates an operation record; then it broadcasts to current members. |
+| `ai`         | `roomId`, `message` | Requires current membership, then broadcasts `{ type, message, roomId }` to active room members, including the sender. It does not persist the message.                                                                       |
 
-Room membership exists only in the running process. The service has no explicit acknowledgement/error protocol and does not check whether a user may join a room. Malformed messages and asynchronous handler errors are logged without crashing the process. High-frequency drawing events are not logged.
+Room connection sets exist in process memory; authorization is stored in PostgreSQL. There is no acknowledgement/error protocol, so rejected joins and unauthorized writes are silently ignored to preserve the current wire protocol. Messages are limited by the configured payload and per-user rate ceilings. Malformed messages and asynchronous handler errors are handled without crashing the process. Drawing payloads are not logged.
 
 ### Backend functions and middleware
 
@@ -339,10 +372,12 @@ Room membership exists only in the running process. The service has no explicit 
 
 Remaining concerns:
 
-- Authentication confirms identity, but room reads/deletes and WebSocket joins do not verify membership or ownership.
-- AI image endpoints are unauthenticated. Uploads are capped at 10 MiB, but a public caller can still consume Gemini spend and server memory.
-- CORS defaults to `*` for compatibility; configure `CORS_ORIGINS` in production.
-- The Gemini response parser falls back to a cleaned text value when JSON parsing fails; schema validation would make the contract safer.
+- AI limits are in-memory and per process. Multiple replicas multiply the effective limit; shared quotas would require centralized storage, intentionally deferred.
+- There is no `AIUsage` or `AIJob` model in the current schema, so this batch enforces limits but does not persist AI usage records.
+- Current frontend AI requests do not include `roomId`, so the server cannot verify that a user has access to the drawing context that produced an upload.
+- WebSocket tokens remain in the query string to preserve the existing client contract. Ensure any external proxy/access logging omits query strings.
+- Existing legacy rooms remain private until their owner shares them or adds members. Owners can still use public visibility to preserve authenticated share-by-slug behavior.
+- Gemini analysis output retains its prior fallback format when provider text is not valid JSON; strict schema validation is a separate API behavior change.
 
 ### Batch 01 architecture update
 
@@ -419,11 +454,19 @@ Rollback: stop the new app version and restore the pre-migration database backup
 - Room slug has an existing unique index; chat history lookup uses `roomId`, and now requests rows in ID order with a bounded page of 2,000 rows. The legacy API does not yet expose a cursor, so very large history needs a follow-up compatible paging contract.
 - Canvas state has a unique room key; element, operation, and snapshot access are indexed by canvas and revision/time. Operation IDs are unique for duplicate prevention.
 - Image uploads are held in memory and limited to 10 MiB. AI requests are synchronous from the HTTP caller's perspective and can consume substantial memory/latency. Large-scale jobs/queues are not introduced.
-- WebSocket connection membership uses room-indexed sets. Database writes happen before chat broadcast and are transactionally paired with canvas projection writes.
+- WebSocket connection membership uses room-indexed sets. Drawing messages recheck and lock the sender's membership in the persistence transaction. Broadcast fan-out performs one indexed membership query for current recipients, so a removed member is removed from the local room before receiving the next event. This adds database work to each event; no performance gain is claimed or measured here.
+- HTTP AI limits and WebSocket message limits use bounded in-memory fixed-window counters. They protect one service process; replicas have independent counters.
 
-#### Security follow-up
+#### Batch 02 security implementation
 
-Room-level authorization remains critical follow-up work: the current HTTP room read/delete endpoints and WebSocket room joins still authenticate identity without checking room membership or ownership. AI upload endpoints remain unauthenticated, though uploads now have a size limit. CORS remains `*` by default for compatibility and should be restricted with `CORS_ORIGINS` when the frontend origin is finalized. JWTs remain compatible with raw-token `Authorization` headers and now also accept `Bearer` syntax; both services must use a 32-character-or-longer shared secret.
+- HTTP and WebSocket services now use one shared HS256 token verifier. New JWTs expire after seven days. Previous tokens without `exp` are accepted only until seven days after their `iat`.
+- HTTP room history, slug lookup, clearing, deletion, membership changes, and visibility changes enforce room access and role checks. Public rooms require authentication and create a membership on first slug access. Private rooms hide existence from nonmembers.
+- WebSocket joins verify a room membership or public-room eligibility. Membership is rechecked before room events are processed; viewers cannot write drawings. Unauthorized messages are discarded without persistence or broadcast.
+- AI routes require authentication, cap and inspect image uploads, enforce per-user request/concurrency limits, use a provider timeout, and return sanitized provider errors. Optional `roomId` requests require membership.
+- HTTP adds security headers, production-only HSTS, a 1 MiB JSON limit, and a sign-up/sign-in rate limit. Production startup rejects wildcard CORS configuration.
+- Existing migrations already contain `RoomMember` and `Room.visibility`; this batch adds no schema migration and does not alter production data.
+
+The access control change intentionally tightens the old behavior: preexisting rooms have `PRIVATE` visibility and only their migrated members can access them. Owners can change visibility or add members through the endpoints above. This is a server-side authorization change; frontend routes and WebSocket message names are unchanged.
 
 ### Running backend packages locally
 

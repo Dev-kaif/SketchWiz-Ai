@@ -24,8 +24,8 @@ function parse(schema: z.ZodTypeAny, service: string) {
   return result.data;
 }
 
-export const serverEnv = () =>
-  parse(
+export const serverEnv = () => {
+  const env = parse(
     shared.extend({
       DATABASE_URL: z.string().min(1),
       JWT_SECRET: z.string().min(32),
@@ -33,6 +33,21 @@ export const serverEnv = () =>
       PORT: z.coerce.number().int().positive().default(5000),
       HOST: z.string().default("0.0.0.0"),
       CORS_ORIGINS: z.string().default("*"),
+      AI_RATE_LIMIT: z.coerce.number().int().positive().default(10),
+      AI_RATE_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
+      AI_MAX_CONCURRENT_PER_USER: z.coerce.number().int().positive().default(2),
+      WS_MAX_PAYLOAD_BYTES: z.coerce
+        .number()
+        .int()
+        .positive()
+        .max(100 * 1024 * 1024)
+        .default(20 * 1024 * 1024),
+      WS_MESSAGE_RATE_LIMIT: z.coerce.number().int().positive().default(500),
+      WS_MESSAGE_RATE_WINDOW_MS: z.coerce
+        .number()
+        .int()
+        .positive()
+        .default(10_000),
     }),
     "HTTP server",
   ) as {
@@ -42,8 +57,21 @@ export const serverEnv = () =>
     PORT: number;
     HOST: string;
     CORS_ORIGINS: string;
+    AI_RATE_LIMIT: number;
+    AI_RATE_WINDOW_MS: number;
+    AI_MAX_CONCURRENT_PER_USER: number;
+    WS_MAX_PAYLOAD_BYTES: number;
+    WS_MESSAGE_RATE_LIMIT: number;
+    WS_MESSAGE_RATE_WINDOW_MS: number;
     NODE_ENV: "development" | "test" | "production";
   };
+  if (env.NODE_ENV === "production" && env.CORS_ORIGINS.trim() === "*") {
+    throw new Error(
+      "Invalid HTTP server environment: CORS_ORIGINS must list trusted origins in production",
+    );
+  }
+  return env;
+};
 
 export const websocketEnv = () =>
   parse(
@@ -52,6 +80,18 @@ export const websocketEnv = () =>
       JWT_SECRET: z.string().min(32),
       PORT: z.coerce.number().int().positive().default(8000),
       HOST: z.string().default("0.0.0.0"),
+      WS_MAX_PAYLOAD_BYTES: z.coerce
+        .number()
+        .int()
+        .positive()
+        .max(100 * 1024 * 1024)
+        .default(20 * 1024 * 1024),
+      WS_MESSAGE_RATE_LIMIT: z.coerce.number().int().positive().default(500),
+      WS_MESSAGE_RATE_WINDOW_MS: z.coerce
+        .number()
+        .int()
+        .positive()
+        .default(10_000),
     }),
     "WebSocket service",
   ) as {
@@ -59,5 +99,8 @@ export const websocketEnv = () =>
     JWT_SECRET: string;
     PORT: number;
     HOST: string;
+    WS_MAX_PAYLOAD_BYTES: number;
+    WS_MESSAGE_RATE_LIMIT: number;
+    WS_MESSAGE_RATE_WINDOW_MS: number;
     NODE_ENV: "development" | "test" | "production";
   };

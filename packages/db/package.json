@@ -23,7 +23,8 @@
     "@types/node": "^26.6.6"
   },
   "exports": {
-    "./client": "./dist/index.js"
+    "./client": "./dist/index.js",
+    "./access": "./dist/index.js"
   },
   "keywords": [],
   "author": "",
