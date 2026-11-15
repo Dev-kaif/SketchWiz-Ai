@@ -285,7 +285,7 @@ app.delete(
         res.status(500).json({ error: "An unexpected error occurred" });
       }
     }
-  }
+  },
 );
 
 //delete canvas content
@@ -311,7 +311,7 @@ app.delete(
         res.status(500).json({ error: "An unexpected error occurred" });
       }
     }
-  }
+  },
 );
 
 const upload = multer();
@@ -328,7 +328,7 @@ interface GenerativePart {
 
 function fileToGenerativePart(
   imageBuffer: Buffer,
-  mimeType: string
+  mimeType: string,
 ): GenerativePart {
   return {
     inlineData: {
@@ -391,12 +391,12 @@ async function analyzeImage(imageBuffer: Buffer): Promise<object[]> {
     const mimeType = "image/jpeg";
     const imagePart: GenerativePart = fileToGenerativePart(
       imageBuffer,
-      mimeType
+      mimeType,
     );
 
     // Send the prompt and image part to the Gemini model
     const result = await genAI.models.generateContent({
-      model: "gemini-2.0-flash",
+      model: "gemini-3.8-flash",
       config: {
         systemInstruction: prompt,
       },
@@ -416,7 +416,7 @@ async function analyzeImage(imageBuffer: Buffer): Promise<object[]> {
       .replace(/\bFalse\b/g, "false")
       .replace(
         /:\s*"([^"]*?)"(?=\s*[},])/g,
-        (match, p1) => `: "${p1.replace(/"/g, '\\"')}"`
+        (match, p1) => `: "${p1.replace(/"/g, '\\"')}"`,
       ); // Escape quotes inside values
 
     let answers: object[] = [];
@@ -460,7 +460,7 @@ app.post(
 
       res.status(500).json({ error: "Internal Server Error" });
     }
-  }
+  },
 );
 
 async function getPromptFromAI(base64Image: GenerativePart): Promise<string> {
@@ -488,7 +488,7 @@ Your effectiveness is measured solely by the clarity, accuracy, and level of det
   `;
 
   const response = await ai.models.generateContent({
-    model: "gemini-2.0-flash",
+    model: "gemini-3.8-flash",
     config: {
       systemInstruction: system_prompt,
     },
@@ -529,7 +529,7 @@ Your effectiveness is judged solely on your ability to **adhere to these directi
   `;
 
   const response = await ai.models.generateContent({
-    model: "gemini-2.0-flash-preview-image-generation",
+    model: "gemini-3.8-flash-preview-image-generation",
     contents: system_prompt + contents,
     config: {
       // systemInstruction: system_prompt,
@@ -559,7 +559,7 @@ async function improveImage(imageBuffer: Buffer) {
   const mimeType = "image/jpeg";
   const base64Image: GenerativePart = fileToGenerativePart(
     imageBuffer,
-    mimeType
+    mimeType,
   );
 
   // 🔮 Step 1: Call GPT-4 Vision or Gemini Vision to generate a better prompt
@@ -623,16 +623,15 @@ app.post(
       const improvedImageBuffer = await improveImage(imageBuffer);
       // const no_bg_image = await remove(improvedImageBuffer!);
 
-      
       res.setHeader("Content-Type", "image/png");
-      
+
       res.send(improvedImageBuffer);
       // res.send(no_bg_image);
     } catch (error) {
       console.log(error);
       res.status(500).json({ error: "Internal Server Error" });
     }
-  }
+  },
 );
 
 const PORT = 5000;
