@@ -26,7 +26,11 @@ const canvasElement = z
 const canvasMutation = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("create"), operationId, element: canvasElement }),
   z.object({ kind: z.literal("update"), operationId, element: canvasElement }),
-  z.object({ kind: z.literal("delete"), operationId, elementId: z.string().min(1).max(512) }),
+  z.object({
+    kind: z.literal("delete"),
+    operationId,
+    elementId: z.string().min(1).max(512),
+  }),
 ]);
 export const WebSocketMessageSchema = z.discriminatedUnion("type", [
   z.object({
@@ -68,15 +72,24 @@ export const WebSocketMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("canvas:batch"),
     roomId: z.number().int().positive(),
-    operations: z.array(canvasMutation).min(1).max(100).superRefine((ops, ctx) => {
-      const ids = new Set<string>();
-      ops.forEach((op, index) => {
-        if (ids.has(op.operationId)) {
-          ctx.addIssue({ code: "custom", message: "Duplicate operationId in batch", path: [index, "operationId"] });
-        }
-        ids.add(op.operationId);
-      });
-    }),
+    expectedRevision: z.number().int().nonnegative().safe().optional(),
+    operations: z
+      .array(canvasMutation)
+      .min(1)
+      .max(100)
+      .superRefine((ops, ctx) => {
+        const ids = new Set<string>();
+        ops.forEach((op, index) => {
+          if (ids.has(op.operationId)) {
+            ctx.addIssue({
+              code: "custom",
+              message: "Duplicate operationId in batch",
+              path: [index, "operationId"],
+            });
+          }
+          ids.add(op.operationId);
+        });
+      }),
   }),
   z.object({
     type: z.literal("canvas:preview"),

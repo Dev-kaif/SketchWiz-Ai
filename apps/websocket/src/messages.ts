@@ -1,9 +1,5 @@
 import { WebSocketMessageSchema } from "@repo/common/schemas";
-import {
-  client,
-  joinPublicRoom,
-  type RoomRole,
-} from "@repo/db/access";
+import { client, joinPublicRoom, type RoomRole } from "@repo/db/access";
 import {
   getCanvasSync,
   persistCanvasMutations,
@@ -62,9 +58,7 @@ async function authorizedRoomRoles(
 }
 
 async function currentRoomRoles(roomId: number, userIds: number[]) {
-  return client.$transaction((tx) =>
-    authorizedRoomRoles(roomId, userIds, tx),
-  );
+  return client.$transaction((tx) => authorizedRoomRoles(roomId, userIds, tx));
 }
 
 function send(socket: Connection["socket"], payload: unknown) {
@@ -119,7 +113,12 @@ export async function handleMessage(
     }
     connection.roles.set(message.roomId, role);
     const state = await getCanvasSync(message.roomId, message.afterRevision);
-    if (state) send(connection.socket, { type: "canvas:sync", roomId: message.roomId, ...state });
+    if (state)
+      send(connection.socket, {
+        type: "canvas:sync",
+        roomId: message.roomId,
+        ...state,
+      });
     return;
   }
 
@@ -133,10 +132,27 @@ export async function handleMessage(
     }
     connection.roles.set(message.roomId, role);
     if (message.type === "canvas:preview" && role === "VIEWER") return;
-    const payload = message.type === "canvas:preview"
-      ? { type: message.type, roomId: message.roomId, preview: message.preview, userId: connection.userId }
-      : { type: message.type, roomId: message.roomId, presence: message.presence, userId: connection.userId };
-    broadcast(memberships, message.roomId, payload, roles, new Set(activeUserIds));
+    const payload =
+      message.type === "canvas:preview"
+        ? {
+            type: message.type,
+            roomId: message.roomId,
+            preview: message.preview,
+            userId: connection.userId,
+          }
+        : {
+            type: message.type,
+            roomId: message.roomId,
+            presence: message.presence,
+            userId: connection.userId,
+          };
+    broadcast(
+      memberships,
+      message.roomId,
+      payload,
+      roles,
+      new Set(activeUserIds),
+    );
     return;
   }
 
@@ -148,21 +164,34 @@ export async function handleMessage(
       return;
     }
     connection.roles.set(message.roomId, role);
-    broadcast(memberships, message.roomId, {
-      type: "ai",
-      message: message.message,
-      roomId: message.roomId,
-    }, roles, new Set(activeUserIds));
+    broadcast(
+      memberships,
+      message.roomId,
+      {
+        type: "ai",
+        message: message.message,
+        roomId: message.roomId,
+      },
+      roles,
+      new Set(activeUserIds),
+    );
     return;
   }
 
   if (message.type === "chat") {
-    const shape = message.message && typeof message.message === "object"
-      ? (message.message as Record<string, unknown>)
-      : null;
+    const shape =
+      message.message && typeof message.message === "object"
+        ? (message.message as Record<string, unknown>)
+        : null;
     const legacyMutation: CanvasMutation[] =
-      shape && typeof shape.id === "string" && typeof shape.type === "string" &&
-      !(shape.type === "image" && typeof shape.src === "string" && shape.src.startsWith("data:"))
+      shape &&
+      typeof shape.id === "string" &&
+      typeof shape.type === "string" &&
+      !(
+        shape.type === "image" &&
+        typeof shape.src === "string" &&
+        shape.src.startsWith("data:")
+      )
         ? [{ kind: "update", operationId: "legacy-pending", element: shape }]
         : [];
     const persisted = await persistCanvasMutations({
@@ -177,23 +206,38 @@ export async function handleMessage(
       return;
     }
     connection.roles.set(message.roomId, persisted.role!);
-    broadcast(memberships, message.roomId, {
-      type: "chat",
-      message: message.message,
-      roomId: message.roomId,
-    }, persisted.roles, new Set(activeUserIds), connection.socket);
+    broadcast(
+      memberships,
+      message.roomId,
+      {
+        type: "chat",
+        message: message.message,
+        roomId: message.roomId,
+      },
+      persisted.roles,
+      new Set(activeUserIds),
+      connection.socket,
+    );
     return;
   }
 
   let mutations: CanvasMutation[];
   if (message.type === "canvas:create" || message.type === "canvas:update") {
-    mutations = [{
-      kind: message.type === "canvas:create" ? "create" : "update",
-      operationId: message.operationId,
-      element: message.element,
-    }];
+    mutations = [
+      {
+        kind: message.type === "canvas:create" ? "create" : "update",
+        operationId: message.operationId,
+        element: message.element,
+      },
+    ];
   } else if (message.type === "canvas:delete") {
-    mutations = [{ kind: "delete", operationId: message.operationId, elementId: message.elementId }];
+    mutations = [
+      {
+        kind: "delete",
+        operationId: message.operationId,
+        elementId: message.elementId,
+      },
+    ];
   } else {
     mutations = message.operations;
   }
@@ -203,6 +247,8 @@ export async function handleMessage(
     userId: connection.userId,
     activeUserIds,
     mutations,
+    expectedRevision:
+      message.type === "canvas:batch" ? message.expectedRevision : undefined,
   });
   if (!persisted.allowed) {
     if (!persisted.role) memberships.leave(connection, message.roomId);
@@ -225,22 +271,37 @@ export async function handleMessage(
   });
   if (persisted.operations.length === 0) return;
   if (message.type === "canvas:batch") {
-    broadcast(memberships, message.roomId, {
-      type: "canvas:batch",
-      roomId: message.roomId,
-      operations: persisted.operations,
-    }, persisted.roles, new Set(activeUserIds), connection.socket);
+    broadcast(
+      memberships,
+      message.roomId,
+      {
+        type: "canvas:batch",
+        roomId: message.roomId,
+        operations: persisted.operations,
+      },
+      persisted.roles,
+      new Set(activeUserIds),
+      connection.socket,
+    );
   } else {
     const operation = persisted.operations[0]!;
-    const eventType = operation.kind === "delete"
-      ? "canvas:delete"
-      : operation.kind === "create"
-        ? "canvas:create"
-        : "canvas:update";
-    broadcast(memberships, message.roomId, {
-      type: eventType,
-      roomId: message.roomId,
-      ...operation,
-    }, persisted.roles, new Set(activeUserIds), connection.socket);
+    const eventType =
+      operation.kind === "delete"
+        ? "canvas:delete"
+        : operation.kind === "create"
+          ? "canvas:create"
+          : "canvas:update";
+    broadcast(
+      memberships,
+      message.roomId,
+      {
+        type: eventType,
+        roomId: message.roomId,
+        ...operation,
+      },
+      persisted.roles,
+      new Set(activeUserIds),
+      connection.socket,
+    );
   }
 }

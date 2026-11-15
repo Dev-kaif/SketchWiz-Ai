@@ -3,6 +3,8 @@ import { Camera } from "./camera.js";
 import { Scene } from "./scene.js";
 import { ImageResources } from "./resources.js";
 import { traceFreehand } from "./tools.js";
+import { selectionBounds, selectionHandles } from "./manipulation.js";
+import { boundsOf } from "./geometry.js";
 
 export class CanvasRenderer {
   private sceneCanvas = document.createElement("canvas");
@@ -26,6 +28,7 @@ export class CanvasRenderer {
     camera: Camera,
     selection: ReadonlySet<string>,
     previews: ReadonlyMap<string, CanvasElement>,
+    hidden: ReadonlySet<string> = new Set(),
   ) {
     const rect = this.canvas.getBoundingClientRect();
     const dpr = Math.max(1, window.devicePixelRatio || 1);
@@ -53,7 +56,7 @@ export class CanvasRenderer {
       for (const element of scene.query(
         camera.viewport(rect.width, rect.height),
       ))
-        this.drawElement(sceneContext, element);
+        if (!hidden.has(element.id)) this.drawElement(sceneContext, element);
       this.sceneDirty = false;
     }
     const overlay = this.overlayCanvas.getContext("2d")!;
@@ -71,15 +74,32 @@ export class CanvasRenderer {
     overlay.setLineDash([5, 4]);
     overlay.lineWidth = 1 / camera.zoom;
     overlay.strokeStyle = "#00aaff";
-    for (const id of selection) {
-      const bounds = scene.getBounds(id);
-      if (!bounds) continue;
+    const selected = [...selection]
+      .map((id) => scene.get(id))
+      .filter((e): e is CanvasElement => !!e);
+    const bounds = selectionBounds(selected);
+    if (bounds) {
       overlay.strokeRect(
         bounds.minX,
         bounds.minY,
         bounds.maxX - bounds.minX,
         bounds.maxY - bounds.minY,
       );
+      const handles = selectionHandles(bounds, camera.zoom);
+      overlay.beginPath();
+      overlay.moveTo(handles[1].x, handles[1].y);
+      overlay.lineTo(handles[8].x, handles[8].y);
+      overlay.strokeStyle = "#00aaff";
+      overlay.lineWidth = 1 / camera.zoom;
+      overlay.stroke();
+      for (const { x, y } of handles) {
+        const size = 8 / camera.zoom;
+        overlay.fillStyle = "#ffffff";
+        overlay.strokeStyle = "#0088dd";
+        overlay.lineWidth = 1 / camera.zoom;
+        overlay.fillRect(x - size / 2, y - size / 2, size, size);
+        overlay.strokeRect(x - size / 2, y - size / 2, size, size);
+      }
     }
     const output = this.context;
     output.setTransform(1, 0, 0, 1, 0, 0);
@@ -89,6 +109,14 @@ export class CanvasRenderer {
   }
   private drawElement(ctx: CanvasRenderingContext2D, e: CanvasElement) {
     ctx.save();
+    if (e.rotation) {
+      const b = boundsOf(e),
+        cx = (b.minX + b.maxX) / 2,
+        cy = (b.minY + b.maxY) / 2;
+      ctx.translate(cx, cy);
+      ctx.rotate(e.rotation);
+      ctx.translate(-cx, -cy);
+    }
     ctx.globalAlpha = e.opacity ?? 1;
     ctx.strokeStyle = e.strokeColor ?? "#fff";
     ctx.fillStyle = e.fillColor ?? "transparent";

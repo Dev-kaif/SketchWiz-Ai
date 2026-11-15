@@ -8,6 +8,14 @@ import {
   FreehandBuilder,
   PointerToolLifecycle,
   Scene,
+  CommandHistory,
+  type ElementChange,
+  type HistoryEntry,
+  hitSelectionHandle,
+  selectionBounds,
+  translateElement,
+  resizeElement,
+  rotateElement,
   splitFreehand,
   sweptIntersects,
   traceFreehand,
@@ -17,85 +25,97 @@ import {
 
 type Point = { x: number; y: number; pressure?: number };
 
-export type Shape =
-  | {
-      id: string;
-      type: "rectangle";
-      x: number;
-      y: number;
-      width: number;
-      height: number;
-      strokeColor: string;
-      strokeWidth: number;
-    }
-  | {
-      id: string;
-      type: "circle";
-      x: number;
-      y: number;
-      radiusX: number;
-      radiusY: number;
-      strokeColor: string;
-      strokeWidth: number;
-    }
-  | {
-      id: string;
-      type: "line";
-      x1: number;
-      y1: number;
-      x2: number;
-      y2: number;
-      strokeColor: string;
-      strokeWidth: number;
-    }
-  | {
-      id: string;
-      type: "triangle";
-      x1: number;
-      y1: number;
-      x2: number;
-      y2: number;
-      x3: number;
-      y3: number;
-      strokeColor: string;
-      strokeWidth: number;
-    }
-  | {
-      id: string;
-      type: "freehand";
-      points: Point[];
-      strokeColor: string;
-      strokeWidth: number;
-    }
-  | {
-      id: string;
-      type: "text";
-      x: number;
-      y: number;
-      content: string;
-      strokeColor: string;
-      strokeWidth: number;
-    }
-  | { id: string; type: "eraser"; points: Point[]; size: number }
-  | {
-      id: string;
-      type: "arrow";
-      x1: number;
-      y1: number;
-      x2: number;
-      y2: number;
-      strokeColor: string;
-      strokeWidth: number;
-    }
-  | {
-      id: string;
-      type: "image";
-      x: number;
-      y: number;
-      width: number;
-      height: number;
-      src: string;
-    };
+type ShapeStyle = {
+  strokeColor?: string;
+  strokeWidth?: number;
+  rotation?: number;
+  opacity?: number;
+  fillColor?: string;
+  order?: number;
+  groupId?: string;
+};
+
+export type Shape = ShapeStyle &
+  (
+    | {
+        id: string;
+        type: "rectangle";
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+        strokeColor: string;
+        strokeWidth: number;
+      }
+    | {
+        id: string;
+        type: "circle";
+        x: number;
+        y: number;
+        radiusX: number;
+        radiusY: number;
+        strokeColor: string;
+        strokeWidth: number;
+      }
+    | {
+        id: string;
+        type: "line";
+        x1: number;
+        y1: number;
+        x2: number;
+        y2: number;
+        strokeColor: string;
+        strokeWidth: number;
+      }
+    | {
+        id: string;
+        type: "triangle";
+        x1: number;
+        y1: number;
+        x2: number;
+        y2: number;
+        x3: number;
+        y3: number;
+        strokeColor: string;
+        strokeWidth: number;
+      }
+    | {
+        id: string;
+        type: "freehand";
+        points: Point[];
+        strokeColor: string;
+        strokeWidth: number;
+      }
+    | {
+        id: string;
+        type: "text";
+        x: number;
+        y: number;
+        content: string;
+        strokeColor: string;
+        strokeWidth: number;
+      }
+    | { id: string; type: "eraser"; points: Point[]; size: number }
+    | {
+        id: string;
+        type: "arrow";
+        x1: number;
+        y1: number;
+        x2: number;
+        y2: number;
+        strokeColor: string;
+        strokeWidth: number;
+      }
+    | {
+        id: string;
+        type: "image";
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+        src: string;
+      }
+  );
 
 interface DrawState {
   shapes: Shape[];
@@ -141,6 +161,23 @@ interface InitDrawControls {
     bounds: { x: number; y: number; width: number; height: number };
   }>;
   deleteShapeById: (id: string) => void;
+  editSelectionStyle: (
+    style: Partial<
+      Pick<Shape, "strokeColor" | "strokeWidth" | "fillColor" | "opacity">
+    >,
+  ) => void;
+  runCanvasCommand: (
+    command:
+      | "undo"
+      | "redo"
+      | "group"
+      | "ungroup"
+      | "front"
+      | "back"
+      | "forward"
+      | "backward"
+      | "delete",
+  ) => void;
   clearLocally: () => void;
   captureSelectedAreaBlob: () => Promise<Blob | null>;
 }
@@ -203,6 +240,8 @@ export default async function initDraw(
       isCanvasEmpty: () => true,
       getSelectedShapesInfo: () => [],
       deleteShapeById: () => {},
+      editSelectionStyle: () => {},
+      runCanvasCommand: () => {},
       clearLocally: () => {},
       captureSelectedAreaBlob: () => Promise.resolve(null),
     };
@@ -224,6 +263,29 @@ export default async function initDraw(
   let pointerToolActive = false;
   let activePointerTool: "freehand" | "eraser" | "precision-eraser" | null =
     null;
+  const history = new CommandHistory(100);
+  const transformPreviews = new Map<string, CanvasElement>();
+  const hiddenTransformIds = new Set<string>();
+  const localOperationIds = new Set<string>();
+  const pendingHistoryByOperation = new Map<
+    string,
+    {
+      entry: HistoryEntry;
+      action: "push" | "undo" | "redo";
+      remaining: Set<string>;
+    }
+  >();
+  let historyBusy = false;
+  let activeTransform: {
+    kind: "move" | "resize" | "rotate";
+    handle: NonNullable<ReturnType<typeof hitSelectionHandle>> | null;
+    start: Point;
+    bounds: NonNullable<ReturnType<typeof selectionBounds>>;
+    center: Point;
+    startAngle: number;
+    originals: Map<string, Shape>;
+  } | null = null;
+  let elementClipboard: Shape[] = [];
 
   // Schedule rendering with requestAnimationFrame.
   let renderRequested = false;
@@ -377,27 +439,44 @@ export default async function initDraw(
   }
 
   function deleteShapeById(id: string) {
-    const index = state.shapes.findIndex((s) => s.id === id);
-    if (index !== -1) {
-      state.shapes.splice(index, 1);
-      scene.delete(id);
-      renderer.invalidateScene();
-      // If the deleted shape was selected, clear selection or adjust index
-      state.selectedShapeIds = state.selectedShapeIds.filter(
-        (selectedId) => selectedId !== id,
-      );
-      scheduleRender();
-      if (roomIdForSync !== null && socket.readyState === WebSocket.OPEN) {
-        socket.send(
-          JSON.stringify({
-            type: "canvas:delete",
-            roomId: roomIdForSync,
-            operationId: crypto.randomUUID(),
-            elementId: id,
-          }),
-        );
-      }
+    const before = state.shapes.find((shape) => shape.id === id);
+    if (!before) return;
+    state.selectedShapeIds = state.selectedShapeIds.filter(
+      (selectedId) => selectedId !== id,
+    );
+    setLocalElement(id, null);
+    persistHistory(
+      {
+        label: "Delete",
+        changes: [
+          { id, before: before as unknown as CanvasElement, after: null },
+        ],
+      },
+      "push",
+    );
+    scheduleRender();
+  }
+
+  function editSelectionStyle(
+    style: Partial<
+      Pick<Shape, "strokeColor" | "strokeWidth" | "fillColor" | "opacity">
+    >,
+  ) {
+    const changes: ElementChange[] = [];
+    for (const id of state.selectedShapeIds) {
+      const before = state.shapes.find((shape) => shape.id === id);
+      if (!before || before.type === "eraser") continue;
+      const after = { ...before, ...style } as Shape;
+      changes.push({
+        id,
+        before: before as unknown as CanvasElement,
+        after: after as unknown as CanvasElement,
+      });
     }
+    if (!changes.length) return;
+    for (const change of changes) setLocalElement(change.id, change.after);
+    persistHistory({ label: "Style", changes }, "push");
+    scheduleRender();
   }
 
   // Add this function inside initDraw, near getSelectedShapesInfo
@@ -658,7 +737,13 @@ export default async function initDraw(
       renderer.invalidateScene();
       renderedCamera = { x: camera.x, y: camera.y, zoom: camera.zoom };
     }
-    renderer.render(scene, camera, new Set(state.selectedShapeIds), new Map());
+    renderer.render(
+      scene,
+      camera,
+      new Set(state.selectedShapeIds),
+      transformPreviews,
+      hiddenTransformIds,
+    );
     ctx.save();
 
     ctx.translate(state.offsetX, state.offsetY);
@@ -814,6 +899,16 @@ export default async function initDraw(
     }
     const type = operation.type ?? operation.kind;
     const payload = operation.payload;
+    const elementId =
+      operation.elementId ??
+      payload?.id ??
+      operation.element?.id ??
+      payload?.element?.id;
+    if (
+      typeof elementId === "string" &&
+      !localOperationIds.delete(operation.operationId)
+    )
+      history.invalidate([elementId]);
     if (type === "canvas:clear" || type === "clear") {
       state.shapes = [];
       scene.clear();
@@ -845,12 +940,23 @@ export default async function initDraw(
 
   function applyServerMessage(data: any) {
     if (data.type === "canvas:ack") {
-      if (data.error)
+      if (data.error) {
+        const pending = new Set(pendingHistoryByOperation.values());
+        for (const group of pending) {
+          for (const id of group.remaining)
+            pendingHistoryByOperation.delete(id);
+          if (group.action === "undo") history.restoreUndo(group.entry);
+          else if (group.action === "redo") history.restoreRedo(group.entry);
+        }
+        historyBusy = false;
         window.dispatchEvent(
           new CustomEvent("canvas:persistence-error", {
             detail: "A canvas change was rejected; syncing saved state",
           }),
         );
+      } else if (Array.isArray(data.operationIds)) {
+        acknowledgeHistory(data.operationIds);
+      }
       // The acknowledgement confirms durability, but another client's operation
       // may precede this revision. Recover from our last applied revision.
       requestCanvasSync();
@@ -859,6 +965,13 @@ export default async function initDraw(
     if (data.type === "canvas:sync" && data.mode) {
       requestedSyncRevision = null;
       if (data.mode === "snapshot") {
+        history.invalidate([
+          ...state.shapes.map((shape) => shape.id),
+          ...(Array.isArray(data.elements)
+            ? data.elements.map((shape: Shape) => shape.id)
+            : []),
+        ]);
+        localOperationIds.clear();
         state.shapes = Array.isArray(data.elements)
           ? (data.elements as Shape[])
           : [];
@@ -932,12 +1045,19 @@ export default async function initDraw(
   const roomId = await loadPreviousShapes();
 
   function sendShapeMessage(shape: Shape) {
-    sendPersistent({
-      type: "canvas:create",
-      roomId,
-      operationId: crypto.randomUUID(),
-      element: shape,
-    });
+    persistHistory(
+      {
+        label: "Create element",
+        changes: [
+          {
+            id: shape.id,
+            before: null,
+            after: shape as unknown as CanvasElement,
+          },
+        ],
+      },
+      "push",
+    );
   }
 
   function sendPersistent(message: unknown) {
@@ -959,6 +1079,121 @@ export default async function initDraw(
         }),
       );
       return false;
+    }
+  }
+
+  function setLocalElement(id: string, element: CanvasElement | null) {
+    const index = state.shapes.findIndex((shape) => shape.id === id);
+    if (element) {
+      const shape = element as unknown as Shape;
+      if (index < 0) state.shapes.push(shape);
+      else state.shapes[index] = shape;
+      scene.set(element);
+    } else {
+      if (index >= 0) state.shapes.splice(index, 1);
+      scene.delete(id);
+    }
+    renderer.invalidateScene();
+  }
+
+  function persistHistory(
+    entry: HistoryEntry,
+    action: "push" | "undo" | "redo",
+  ) {
+    if (roomIdForSync === null) return false;
+    const operations: Array<Record<string, unknown>> = [];
+    for (const change of entry.changes) {
+      const source = action === "undo" ? change.after : change.before;
+      const target = action === "undo" ? change.before : change.after;
+      if (!target) {
+        if (source)
+          operations.push({
+            kind: "delete",
+            operationId: crypto.randomUUID(),
+            elementId: change.id,
+          });
+      } else if (!source) {
+        operations.push({
+          kind: "create",
+          operationId: crypto.randomUUID(),
+          element: target,
+        });
+      } else {
+        operations.push({
+          kind: "update",
+          operationId: crypto.randomUUID(),
+          element: target,
+        });
+      }
+    }
+    if (!operations.length) {
+      if (action === "push") history.push(entry);
+      else if (action === "undo") history.commitUndo(entry);
+      else history.commitRedo(entry);
+      return true;
+    }
+    if (operations.length > 100) {
+      window.dispatchEvent(
+        new CustomEvent("canvas:persistence-error", {
+          detail: "Select fewer than 100 objects for one atomic change",
+        }),
+      );
+      if (action === "push")
+        for (const change of entry.changes)
+          setLocalElement(change.id, change.before);
+      scheduleRender();
+      return false;
+    }
+    const operationIds = operations.map((operation) =>
+      String(operation.operationId),
+    );
+    if (
+      !sendPersistent({
+        type: "canvas:batch",
+        roomId,
+        operations,
+        ...(action === "push" ? {} : { expectedRevision: canvasRevision }),
+      })
+    )
+      return false;
+    if (action !== "push")
+      for (const change of entry.changes)
+        setLocalElement(
+          change.id,
+          action === "undo" ? change.before : change.after,
+        );
+    const pending = { entry, action, remaining: new Set(operationIds) };
+    for (const id of operationIds) {
+      localOperationIds.add(id);
+      pendingHistoryByOperation.set(id, pending);
+    }
+    scheduleRender();
+    return true;
+  }
+
+  function acknowledgeHistory(operationIds: Array<{ operationId: string }>) {
+    for (const result of operationIds) {
+      const pending = pendingHistoryByOperation.get(result.operationId);
+      if (!pending) continue;
+      pendingHistoryByOperation.delete(result.operationId);
+      pending.remaining.delete(result.operationId);
+      if (pending.remaining.size) continue;
+      if (pending.action === "push") history.push(pending.entry);
+      else if (pending.action === "undo") history.commitUndo(pending.entry);
+      else history.commitRedo(pending.entry);
+      historyBusy = false;
+    }
+  }
+
+  function performHistory(action: "undo" | "redo") {
+    if (historyBusy || pendingHistoryByOperation.size) return;
+    const entry = action === "undo" ? history.takeUndo() : history.takeRedo();
+    if (!entry) return;
+    historyBusy = true;
+    if (!persistHistory(entry, action)) {
+      if (action === "undo") history.restoreUndo(entry);
+      else history.restoreRedo(entry);
+      historyBusy = false;
     }
   }
 
@@ -1042,6 +1277,7 @@ export default async function initDraw(
       return;
     // `ctx` is guaranteed non-null here due to the initial check in initDraw
     const { x: worldX, y: worldY } = clientToWorld(e.clientX, e.clientY);
+    if (activeTransform) return;
     const isCtrlOrCmdPressed = e.ctrlKey || e.metaKey;
 
     // 1. Handle active text preview (highest priority as it's an overlay)
@@ -1096,59 +1332,178 @@ export default async function initDraw(
   function handleSelectionStart(
     worldX: number,
     worldY: number,
-    isCtrlOrCmdPressed: boolean,
+    additive: boolean,
   ) {
-    if (!ctx) return;
-    let clickedShapeId: string | null = null;
-    // Iterate backwards to find the topmost shape that was clicked
-    const tolerance = 8 / state.scale;
-    const candidates = scene.query({
-      minX: worldX - tolerance,
-      minY: worldY - tolerance,
-      maxX: worldX + tolerance,
-      maxY: worldY + tolerance,
-    });
-    for (let i = candidates.length - 1; i >= 0; i--) {
-      const shape = candidates[i];
-      if (shape) {
-        // Type guard for safety
-        const bounds = getShapeBounds(ctx, shape as unknown as Shape);
-        if (
-          bounds &&
-          worldX >= bounds.x &&
-          worldX <= bounds.x + bounds.width &&
-          worldY >= bounds.y &&
-          worldY <= bounds.y + bounds.height
-        ) {
-          clickedShapeId = shape.id;
-          break;
-        }
+    const selected = state.selectedShapeIds
+      .map((id) => scene.get(id))
+      .filter((e): e is CanvasElement => !!e);
+    const bounds = selectionBounds(selected);
+    if (bounds) {
+      const handle = hitSelectionHandle(
+        bounds,
+        { x: worldX, y: worldY },
+        state.scale,
+      );
+      if (handle) {
+        beginTransform(
+          handle === "rotate" ? "rotate" : "resize",
+          { x: worldX, y: worldY },
+          handle,
+        );
+        return;
       }
     }
-
-    if (clickedShapeId) {
-      const isAlreadySelected = state.selectedShapeIds.includes(clickedShapeId);
-      if (isCtrlOrCmdPressed) {
-        // Toggle selection for individual shape
-        state.selectedShapeIds = isAlreadySelected
-          ? state.selectedShapeIds.filter((id) => id !== clickedShapeId)
-          : [...state.selectedShapeIds, clickedShapeId];
-      } else {
-        // Single select: clear all and select only this one
-        state.selectedShapeIds = [clickedShapeId];
-      }
-      state.isMarqueeSelecting = false; // Ensure marquee is off
+    const hit = scene.hit(worldX, worldY, 8 / state.scale);
+    if (hit) {
+      const hitIds = hit.groupId
+        ? state.shapes
+            .filter((shape) => shape.groupId === hit.groupId)
+            .map((shape) => shape.id)
+        : [hit.id];
+      const alreadySelected = hitIds.every((id) =>
+        state.selectedShapeIds.includes(id),
+      );
+      if (additive) {
+        state.selectedShapeIds = alreadySelected
+          ? state.selectedShapeIds.filter((id) => !hitIds.includes(id))
+          : [...new Set([...state.selectedShapeIds, ...hitIds])];
+      } else if (!alreadySelected) state.selectedShapeIds = hitIds;
+      state.isMarqueeSelecting = false;
+      if (!additive || !alreadySelected)
+        beginTransform("move", { x: worldX, y: worldY }, null);
     } else {
-      // No shape clicked, start marquee selection
       state.isMarqueeSelecting = true;
       state.marqueeStartX = worldX;
       state.marqueeStartY = worldY;
       state.marqueeCurrentX = worldX;
       state.marqueeCurrentY = worldY;
-      if (!isCtrlOrCmdPressed) {
-        state.selectedShapeIds = []; // Clear existing selection if not multi-selecting
-      }
+      if (!additive) state.selectedShapeIds = [];
     }
+    scheduleRender();
+  }
+
+  function beginTransform(
+    kind: "move" | "resize" | "rotate",
+    start: Point,
+    handle: NonNullable<ReturnType<typeof hitSelectionHandle>> | null,
+  ) {
+    const originals = new Map<string, Shape>();
+    for (const id of state.selectedShapeIds) {
+      const shape = state.shapes.find((item) => item.id === id);
+      if (shape) originals.set(id, structuredClone(shape));
+    }
+    const bounds = selectionBounds([
+      ...originals.values(),
+    ] as unknown as CanvasElement[]);
+    if (!bounds || !originals.size) return;
+    const center = {
+      x: (bounds.minX + bounds.maxX) / 2,
+      y: (bounds.minY + bounds.maxY) / 2,
+    };
+    activeTransform = {
+      kind,
+      handle,
+      start,
+      bounds,
+      center,
+      startAngle: Math.atan2(start.y - center.y, start.x - center.x),
+      originals,
+    };
+  }
+
+  function updateTransformPreview(x: number, y: number, snap: boolean) {
+    const transform = activeTransform;
+    if (!transform) return;
+    const dx = x - transform.start.x,
+      dy = y - transform.start.y;
+    let target = transform.bounds;
+    let angle =
+      Math.atan2(y - transform.center.y, x - transform.center.x) -
+      transform.startAngle;
+    if (transform.kind === "resize" && transform.handle)
+      target = resizedSelectionBounds(
+        transform.bounds,
+        transform.handle,
+        x,
+        y,
+        snap,
+      );
+    if (transform.kind === "rotate" && snap)
+      angle = Math.round(angle / (Math.PI / 12)) * (Math.PI / 12);
+    transformPreviews.clear();
+    hiddenTransformIds.clear();
+    for (const [id, original] of transform.originals) {
+      const element = original as unknown as CanvasElement;
+      const next =
+        transform.kind === "move"
+          ? translateElement(element, dx, dy)
+          : transform.kind === "resize"
+            ? resizeElement(element, transform.bounds, target)
+            : rotateElement(element, transform.center, angle);
+      transformPreviews.set(id, next);
+      hiddenTransformIds.add(id);
+    }
+    renderer.invalidateScene();
+    renderer.invalidateOverlay();
+    scheduleRender();
+  }
+
+  function resizedSelectionBounds(
+    original: NonNullable<ReturnType<typeof selectionBounds>>,
+    handle: NonNullable<ReturnType<typeof hitSelectionHandle>>,
+    x: number,
+    y: number,
+    proportional: boolean,
+  ) {
+    const next = { ...original };
+    if (handle.includes("w")) next.minX = x;
+    if (handle.includes("e")) next.maxX = x;
+    if (handle.includes("n")) next.minY = y;
+    if (handle.includes("s")) next.maxY = y;
+    const min = 2 / state.scale;
+    if (next.maxX - next.minX < min) {
+      if (handle.includes("w")) next.minX = next.maxX - min;
+      else next.maxX = next.minX + min;
+    }
+    if (next.maxY - next.minY < min) {
+      if (handle.includes("n")) next.minY = next.maxY - min;
+      else next.maxY = next.minY + min;
+    }
+    if (proportional) {
+      const ratio =
+        (original.maxX - original.minX) /
+        Math.max(0.001, original.maxY - original.minY);
+      let w = next.maxX - next.minX,
+        h = next.maxY - next.minY;
+      if (
+        Math.abs(w / (original.maxX - original.minX) - 1) >=
+        Math.abs(h / (original.maxY - original.minY) - 1)
+      )
+        h = w / ratio;
+      else w = h * ratio;
+      if (handle.includes("w")) next.minX = next.maxX - w;
+      else next.maxX = next.minX + w;
+      if (handle.includes("n")) next.minY = next.maxY - h;
+      else next.maxY = next.minY + h;
+    }
+    return next;
+  }
+
+  function finishTransform() {
+    const transform = activeTransform;
+    if (!transform) return;
+    const changes: ElementChange[] = [];
+    for (const [id, before] of transform.originals) {
+      const after = transformPreviews.get(id);
+      if (after)
+        changes.push({ id, before: before as unknown as CanvasElement, after });
+    }
+    activeTransform = null;
+    transformPreviews.clear();
+    hiddenTransformIds.clear();
+    for (const change of changes) setLocalElement(change.id, change.after);
+    if (changes.length)
+      persistHistory({ label: transform.kind, changes }, "push");
     scheduleRender();
   }
 
@@ -1192,6 +1547,10 @@ export default async function initDraw(
     )
       return;
     const { x: worldX, y: worldY } = clientToWorld(e.clientX, e.clientY);
+    if (activeTransform) {
+      updateTransformPreview(worldX, worldY, e.shiftKey);
+      return;
+    }
 
     // Prioritize active drawing/panning states
     if (state.isErasing) {
@@ -1223,6 +1582,10 @@ export default async function initDraw(
       return;
     // `ctx` is guaranteed non-null here due to the initial check in initDraw
     const { x: worldX, y: worldY } = clientToWorld(e.clientX, e.clientY);
+    if (activeTransform) {
+      finishTransform();
+      return;
+    }
     const isCtrlOrCmdPressed = e.ctrlKey || e.metaKey;
 
     // 1. Handle right-click for ending panning
@@ -1315,19 +1678,7 @@ export default async function initDraw(
     const shapeIndexes = new Map(
       state.shapes.map((shape, index) => [shape.id, index]),
     );
-    const deleteOperations: Array<{
-      kind: "delete";
-      operationId: string;
-      elementId: string;
-    }> = [];
-    const precisionBatches: Array<
-      Array<{
-        kind: "delete" | "create";
-        operationId: string;
-        elementId?: string;
-        element?: Shape;
-      }>
-    > = [];
+    const historyChanges: ElementChange[] = [];
     const replacements = new Map<string, Shape[]>();
     const deletions = new Set<string>();
     for (const candidate of candidates) {
@@ -1341,25 +1692,13 @@ export default async function initDraw(
           radius,
           shape.strokeWidth,
         );
-        const operations: Array<{
-          kind: "delete" | "create";
-          operationId: string;
-          elementId?: string;
-          element?: Shape;
-        }> = [
-          {
-            kind: "delete",
-            operationId: crypto.randomUUID(),
-            elementId: shape.id,
-          },
-        ];
         const orderedPieces = pieces.map((points, part) => ({
           ...shape,
           id: crypto.randomUUID(),
           points,
           order: index + (part + 1) / (pieces.length + 1),
         })) as Shape[];
-        if (operations.length + orderedPieces.length > 100) {
+        if (historyChanges.length + 1 + orderedPieces.length > 100) {
           window.dispatchEvent(
             new CustomEvent("canvas:persistence-error", {
               detail: "This stroke produced too many pieces to erase safely",
@@ -1367,25 +1706,37 @@ export default async function initDraw(
           );
           continue;
         }
+        historyChanges.push({
+          id: shape.id,
+          before: shape as unknown as CanvasElement,
+          after: null,
+        });
         for (const element of orderedPieces)
-          operations.push({
-            kind: "create",
-            operationId: crypto.randomUUID(),
-            element,
+          historyChanges.push({
+            id: element.id,
+            before: null,
+            after: element as unknown as CanvasElement,
           });
-        precisionBatches.push(operations);
         deletions.add(shape.id);
         replacements.set(shape.id, orderedPieces);
       } else {
-        deleteOperations.push({
-          kind: "delete",
-          operationId: crypto.randomUUID(),
-          elementId: shape.id,
+        historyChanges.push({
+          id: shape.id,
+          before: shape as unknown as CanvasElement,
+          after: null,
         });
         deletions.add(shape.id);
       }
     }
     if (!deletions.size) return;
+    if (historyChanges.length > 100) {
+      window.dispatchEvent(
+        new CustomEvent("canvas:persistence-error", {
+          detail: "Erase fewer objects at once",
+        }),
+      );
+      return;
+    }
     const next: Shape[] = [];
     for (const shape of state.shapes) {
       if (!deletions.has(shape.id)) next.push(shape);
@@ -1399,15 +1750,7 @@ export default async function initDraw(
       (id) => !deletions.has(id),
     );
     renderer.invalidateScene();
-    for (const batch of precisionBatches)
-      sendPersistent({ type: "canvas:batch", roomId, operations: batch });
-    for (let i = 0; i < deleteOperations.length; i += 100) {
-      sendPersistent({
-        type: "canvas:batch",
-        roomId,
-        operations: deleteOperations.slice(i, i + 100),
-      });
-    }
+    persistHistory({ label: "Erase", changes: historyChanges }, "push");
   }
 
   // Helper for finalizing regular shape drawing
@@ -1655,14 +1998,222 @@ export default async function initDraw(
     activeTextCleanup = cleanup; // Store the cleanup function
   }
 
+  function selectedShapes() {
+    const selected = new Set(state.selectedShapeIds);
+    return state.shapes.filter((shape) => selected.has(shape.id));
+  }
+
+  function changeGroup(ungroup: boolean) {
+    const selected = selectedShapes();
+    if (!selected.length) return;
+    const groupId = ungroup ? null : crypto.randomUUID();
+    const changes: ElementChange[] = selected.map((before) => {
+      const after = { ...before } as Shape;
+      if (groupId) after.groupId = groupId;
+      else delete after.groupId;
+      return {
+        id: before.id,
+        before: before as unknown as CanvasElement,
+        after: after as unknown as CanvasElement,
+      };
+    });
+    for (const change of changes) setLocalElement(change.id, change.after);
+    persistHistory({ label: ungroup ? "Ungroup" : "Group", changes }, "push");
+    scheduleRender();
+  }
+
+  function reorderSelection(
+    direction: "front" | "back" | "forward" | "backward",
+  ) {
+    const ordered = scene.all().map((element) => element as unknown as Shape);
+    const selected = new Set(state.selectedShapeIds);
+    if (!selected.size) return;
+    let next = [...ordered];
+    if (direction === "front")
+      next = [
+        ...next.filter((shape) => !selected.has(shape.id)),
+        ...next.filter((shape) => selected.has(shape.id)),
+      ];
+    else if (direction === "back")
+      next = [
+        ...next.filter((shape) => selected.has(shape.id)),
+        ...next.filter((shape) => !selected.has(shape.id)),
+      ];
+    else if (direction === "forward") {
+      for (let i = next.length - 2; i >= 0; i--)
+        if (selected.has(next[i]!.id) && !selected.has(next[i + 1]!.id))
+          [next[i], next[i + 1]] = [next[i + 1]!, next[i]!];
+    } else {
+      for (let i = 1; i < next.length; i++)
+        if (selected.has(next[i]!.id) && !selected.has(next[i - 1]!.id))
+          [next[i], next[i - 1]] = [next[i - 1]!, next[i]!];
+    }
+    const changes: ElementChange[] = [];
+    next.forEach((before, order) => {
+      if (before.order === order) return;
+      const after = { ...before, order } as Shape;
+      changes.push({
+        id: before.id,
+        before: before as unknown as CanvasElement,
+        after: after as unknown as CanvasElement,
+      });
+    });
+    if (!changes.length) return;
+    for (const change of changes) setLocalElement(change.id, change.after);
+    persistHistory({ label: "Layer order", changes }, "push");
+    scheduleRender();
+  }
+
+  function pasteSelection(duplicate = false) {
+    const source = duplicate ? selectedShapes() : elementClipboard;
+    if (!source.length) return;
+    if (!duplicate) elementClipboard = structuredClone(source);
+    const groups = new Map<string, string>();
+    const copies = source.map((shape, index) => {
+      const copy = translateElement(
+        shape as unknown as CanvasElement,
+        20 / state.scale,
+        20 / state.scale,
+      ) as unknown as Shape;
+      copy.id = crypto.randomUUID();
+      copy.order = scene.size + index;
+      if (copy.groupId) {
+        if (!groups.has(copy.groupId))
+          groups.set(copy.groupId, crypto.randomUUID());
+        copy.groupId = groups.get(copy.groupId)!;
+      }
+      return copy;
+    });
+    const changes: ElementChange[] = copies.map((after) => ({
+      id: after.id,
+      before: null,
+      after: after as unknown as CanvasElement,
+    }));
+    for (const copy of copies)
+      setLocalElement(copy.id, copy as unknown as CanvasElement);
+    state.selectedShapeIds = copies.map((shape) => shape.id);
+    persistHistory(
+      { label: duplicate ? "Duplicate" : "Paste", changes },
+      "push",
+    );
+    scheduleRender();
+  }
+
+  function deleteSelection() {
+    const changes: ElementChange[] = selectedShapes().map((before) => ({
+      id: before.id,
+      before: before as unknown as CanvasElement,
+      after: null,
+    }));
+    if (!changes.length) return;
+    for (const change of changes) setLocalElement(change.id, null);
+    state.selectedShapeIds = [];
+    persistHistory({ label: "Delete", changes }, "push");
+    scheduleRender();
+  }
+
+  function isTypingTarget(target: EventTarget | null) {
+    return (
+      target instanceof HTMLElement &&
+      (target.isContentEditable ||
+        /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))
+    );
+  }
+
+  function handleCanvasKeydown(event: KeyboardEvent) {
+    if (isTypingTarget(event.target) || activeTextCleanup) return;
+    const command = event.metaKey || event.ctrlKey;
+    const key = event.key.toLowerCase();
+    if (command && key === "z") {
+      event.preventDefault();
+      performHistory(event.shiftKey ? "redo" : "undo");
+    } else if (command && key === "y") {
+      event.preventDefault();
+      performHistory("redo");
+    } else if (command && key === "a") {
+      event.preventDefault();
+      state.selectedShapeIds = state.shapes.map((shape) => shape.id);
+      scheduleRender();
+    } else if (command && key === "c") {
+      if (state.selectedShapeIds.length) {
+        event.preventDefault();
+        elementClipboard = structuredClone(selectedShapes());
+      }
+    } else if (command && key === "v") {
+      event.preventDefault();
+      pasteSelection();
+    } else if (command && key === "d") {
+      event.preventDefault();
+      pasteSelection(true);
+    } else if (command && key === "g") {
+      event.preventDefault();
+      changeGroup(event.shiftKey);
+    } else if (event.key === "Delete" || event.key === "Backspace") {
+      event.preventDefault();
+      deleteSelection();
+    } else if (event.key === "Escape") {
+      state.selectedShapeIds = [];
+      state.isMarqueeSelecting = false;
+      scheduleRender();
+    } else if (event.altKey && event.key === "ArrowUp") {
+      event.preventDefault();
+      reorderSelection(event.shiftKey ? "front" : "forward");
+    } else if (event.altKey && event.key === "ArrowDown") {
+      event.preventDefault();
+      reorderSelection(event.shiftKey ? "back" : "backward");
+    } else if (
+      state.selectedShapeIds.length &&
+      ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)
+    ) {
+      event.preventDefault();
+      const step = (event.shiftKey ? 10 : 1) / state.scale;
+      const dx =
+        event.key === "ArrowLeft"
+          ? -step
+          : event.key === "ArrowRight"
+            ? step
+            : 0;
+      const dy =
+        event.key === "ArrowUp" ? -step : event.key === "ArrowDown" ? step : 0;
+      const changes: ElementChange[] = selectedShapes().map((before) => ({
+        id: before.id,
+        before: before as unknown as CanvasElement,
+        after: translateElement(before as unknown as CanvasElement, dx, dy),
+      }));
+      for (const change of changes) setLocalElement(change.id, change.after);
+      if (changes.length) persistHistory({ label: "Nudge", changes }, "push");
+      scheduleRender();
+    }
+  }
+
+  function runCanvasCommand(
+    command:
+      | "undo"
+      | "redo"
+      | "group"
+      | "ungroup"
+      | "front"
+      | "back"
+      | "forward"
+      | "backward"
+      | "delete",
+  ) {
+    if (command === "undo" || command === "redo") performHistory(command);
+    else if (command === "group" || command === "ungroup")
+      changeGroup(command === "ungroup");
+    else if (command === "delete") deleteSelection();
+    else reorderSelection(command);
+  }
+
   // Register event listeners.
   canvas.addEventListener("mousedown", handleMouseDown);
-  canvas.addEventListener("mousemove", handleMouseMove);
-  canvas.addEventListener("mouseup", handleMouseUp);
+  window.addEventListener("mousemove", handleMouseMove);
+  window.addEventListener("mouseup", handleMouseUp);
   canvas.addEventListener("wheel", handleWheel);
   canvas.addEventListener("dblclick", handleDoubleClick);
   const handleWindowResize = () => scheduleRender();
   window.addEventListener("resize", handleWindowResize);
+  document.addEventListener("keydown", handleCanvasKeydown);
 
   // Initial render.
   scheduleRender();
@@ -1671,11 +2222,12 @@ export default async function initDraw(
     cleanup: function cleanup() {
       drawingInput.dispose();
       canvas.removeEventListener("mousedown", handleMouseDown);
-      canvas.removeEventListener("mousemove", handleMouseMove);
-      canvas.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
       canvas.removeEventListener("wheel", handleWheel);
       canvas.removeEventListener("dblclick", handleDoubleClick);
       window.removeEventListener("resize", handleWindowResize);
+      document.removeEventListener("keydown", handleCanvasKeydown);
       imageCache.clear();
       if (renderFrame) cancelAnimationFrame(renderFrame);
       renderFrame = 0;
@@ -1689,6 +2241,8 @@ export default async function initDraw(
     isCanvasEmpty: isCanvasEmpty,
     getSelectedShapesInfo: getSelectedShapesInfo,
     deleteShapeById: deleteShapeById,
+    editSelectionStyle,
+    runCanvasCommand,
     clearLocally,
     captureSelectedAreaBlob: captureSelectedAreaBlob,
   };

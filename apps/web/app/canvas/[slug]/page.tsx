@@ -57,6 +57,8 @@ const Page = ({ params }: Param) => {
   // Stroke settings (default: white & 3)
   const [strokeColor, setStrokeColor] = useState("#ffffff");
   const [strokeWidth, setStrokeWidth] = useState(3);
+  const [fillColor, setFillColor] = useState("#ffffff");
+  const [elementOpacity, setElementOpacity] = useState(1);
 
   // New state for storing the AI response
   const [aiResponse, setAiResponse] = useState<string | null>(null);
@@ -153,6 +155,24 @@ const Page = ({ params }: Param) => {
           bounds: { x: number; y: number; width: number; height: number };
         }>;
         deleteShapeById: (id: string) => void;
+        editSelectionStyle: (style: {
+          strokeColor?: string;
+          strokeWidth?: number;
+          fillColor?: string;
+          opacity?: number;
+        }) => void;
+        runCanvasCommand: (
+          command:
+            | "undo"
+            | "redo"
+            | "group"
+            | "ungroup"
+            | "front"
+            | "back"
+            | "forward"
+            | "backward"
+            | "delete",
+        ) => void;
         clearLocally: () => void;
         captureSelectedAreaBlob: () => Promise<Blob | null>;
       }
@@ -467,6 +487,9 @@ const Page = ({ params }: Param) => {
               max="10"
               value={strokeWidth}
               onChange={(e) => setStrokeWidth(parseInt(e.target.value))}
+              onPointerUp={() =>
+                cleanupRef.current?.editSelectionStyle({ strokeWidth })
+              }
               className="w-full"
             />
           </div>
@@ -480,7 +503,12 @@ const Page = ({ params }: Param) => {
                   type="color"
                   id="strokeColor"
                   value={strokeColor}
-                  onChange={(e) => setStrokeColor(e.target.value)}
+                  onChange={(e) => {
+                    setStrokeColor(e.target.value);
+                    cleanupRef.current?.editSelectionStyle({
+                      strokeColor: e.target.value,
+                    });
+                  }}
                   className="w-full h-10 p-0 border-none bg-gray-700"
                 />
               </div>
@@ -490,7 +518,12 @@ const Page = ({ params }: Param) => {
                   {basicColors.map((col) => (
                     <button
                       key={col}
-                      onClick={() => setStrokeColor(col)}
+                      onClick={() => {
+                        setStrokeColor(col);
+                        cleanupRef.current?.editSelectionStyle({
+                          strokeColor: col,
+                        });
+                      }}
                       style={{ backgroundColor: col }}
                       className={`w-6 h-6 rounded-full border border-gray-600 ${
                         strokeColor.toLowerCase() === col.toLowerCase()
@@ -501,8 +534,80 @@ const Page = ({ params }: Param) => {
                   ))}
                 </div>
               </div>
+              <div className="mt-3">
+                <label htmlFor="fillColor" className="block text-sm mb-1">
+                  Fill color:
+                </label>
+                <input
+                  id="fillColor"
+                  type="color"
+                  value={fillColor}
+                  onChange={(event) => {
+                    setFillColor(event.target.value);
+                    cleanupRef.current?.editSelectionStyle({
+                      fillColor: event.target.value,
+                    });
+                  }}
+                  className="w-full h-8 bg-gray-700"
+                />
+              </div>
+              <div className="mt-3">
+                <label htmlFor="elementOpacity" className="block text-sm mb-1">
+                  Selected opacity: {Math.round(elementOpacity * 100)}%
+                </label>
+                <input
+                  id="elementOpacity"
+                  type="range"
+                  min="0.1"
+                  max="1"
+                  step="0.05"
+                  value={elementOpacity}
+                  onChange={(event) =>
+                    setElementOpacity(Number(event.target.value))
+                  }
+                  onPointerUp={() =>
+                    cleanupRef.current?.editSelectionStyle({
+                      opacity: elementOpacity,
+                    })
+                  }
+                  className="w-full"
+                />
+              </div>
             </div>
           )}
+          <div className="mt-4 grid grid-cols-2 gap-2">
+            {[
+              ["undo", "Undo"],
+              ["redo", "Redo"],
+              ["group", "Group"],
+              ["ungroup", "Ungroup"],
+              ["backward", "Backward"],
+              ["forward", "Forward"],
+              ["back", "Send to back"],
+              ["front", "Bring to front"],
+            ].map(([command, label]) => (
+              <button
+                key={command}
+                type="button"
+                onClick={() =>
+                  cleanupRef.current?.runCanvasCommand(
+                    command as
+                      | "undo"
+                      | "redo"
+                      | "group"
+                      | "ungroup"
+                      | "front"
+                      | "back"
+                      | "forward"
+                      | "backward",
+                  )
+                }
+                className="rounded bg-gray-800 px-2 py-1 text-xs hover:bg-indigo-600"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
       )}
 

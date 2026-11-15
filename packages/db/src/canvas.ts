@@ -2,7 +2,11 @@ import { client } from "./index.js";
 import { Prisma, type RoomRole } from "./generated/prisma/client.js";
 
 export type CanvasMutation =
-  | { kind: "create" | "update"; operationId: string; element: Record<string, unknown> }
+  | {
+      kind: "create" | "update";
+      operationId: string;
+      element: Record<string, unknown>;
+    }
   | { kind: "delete"; operationId: string; elementId: string };
 
 type OperationResult = {
@@ -30,7 +34,10 @@ function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value && typeof value === "object") {
     const record = value as Record<string, unknown>;
-    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+      .join(",")}}`;
   }
   return JSON.stringify(value) ?? "undefined";
 }
@@ -40,18 +47,21 @@ export async function persistCanvasMutations(input: {
   userId: number;
   activeUserIds: number[];
   mutations: CanvasMutation[];
+  expectedRevision?: number;
   legacyMessage?: unknown;
 }) {
   const userIds = [...new Set([input.userId, ...input.activeUserIds])];
   const placeholders = userIds.map((_, index) => `$${index + 2}`).join(", ");
 
   return client.$transaction(async (tx): Promise<PersistCanvasResult> => {
-    const rows = await tx.$queryRawUnsafe<Array<{
-      canvasId: number;
-      revision: bigint;
-      userId: number;
-      role: RoomRole;
-    }>>(
+    const rows = await tx.$queryRawUnsafe<
+      Array<{
+        canvasId: number;
+        revision: bigint;
+        userId: number;
+        role: RoomRole;
+      }>
+    >(
       `SELECT c."id" AS "canvasId", c."revision", m."userId", m."role" FROM "Canvas" c JOIN "RoomMember" m ON m."roomId" = c."roomId" WHERE c."roomId" = $1 AND m."userId" IN (${placeholders}) FOR UPDATE OF c, m`,
       input.roomId,
       ...userIds,
@@ -60,7 +70,10 @@ export async function persistCanvasMutations(input: {
     const canvas = rows[0];
     const senderRole = roles.get(input.userId);
     const initialRevision = canvas ? Number(canvas.revision) : 0;
-    const result = (allowed: boolean, role?: RoomRole): PersistCanvasResult => ({
+    const result = (
+      allowed: boolean,
+      role?: RoomRole,
+    ): PersistCanvasResult => ({
       allowed,
       role,
       roles,
@@ -70,6 +83,11 @@ export async function persistCanvasMutations(input: {
     });
     if (!canvas || !senderRole) return result(false);
     if (senderRole === "VIEWER") return result(false, senderRole);
+    if (
+      input.expectedRevision !== undefined &&
+      input.expectedRevision !== initialRevision
+    )
+      return { ...result(false, senderRole), conflict: true };
 
     let legacyOperationId: string | undefined;
     if (input.legacyMessage !== undefined) {
@@ -92,21 +110,43 @@ export async function persistCanvasMutations(input: {
       return { ...result(true, senderRole), results: [] };
 
     const existingOperations = await tx.canvasOperation.findMany({
-      where: { operationId: { in: mutations.map((mutation) => mutation.operationId) } },
+      where: {
+        operationId: { in: mutations.map((mutation) => mutation.operationId) },
+      },
       select: { operationId: true, canvasId: true, revision: true },
     });
-    const operationById = new Map(existingOperations.map((operation) => [operation.operationId, operation]));
-    if (existingOperations.some((operation) => operation.canvasId !== canvas.canvasId))
+    const operationById = new Map(
+      existingOperations.map((operation) => [operation.operationId, operation]),
+    );
+    if (
+      existingOperations.some(
+        (operation) => operation.canvasId !== canvas.canvasId,
+      )
+    )
       return { ...result(false, senderRole), conflict: true };
 
-    const touchedShapeIds = [...new Set(mutations.flatMap((mutation) =>
-      mutation.kind === "delete" ? [mutation.elementId] : [String(mutation.element.id)],
-    ))];
+    const touchedShapeIds = [
+      ...new Set(
+        mutations.flatMap((mutation) =>
+          mutation.kind === "delete"
+            ? [mutation.elementId]
+            : [String(mutation.element.id)],
+        ),
+      ),
+    ];
     const existingElements = await tx.canvasElement.findMany({
-      where: { canvasId: canvas.canvasId, id: { in: touchedShapeIds.map((id) => elementId(canvas.canvasId, id)) } },
+      where: {
+        canvasId: canvas.canvasId,
+        id: { in: touchedShapeIds.map((id) => elementId(canvas.canvasId, id)) },
+      },
       select: { id: true, revision: true, properties: true },
     });
-    const initial = new Map(existingElements.map((element) => [element.id, element.properties as Record<string, unknown>]));
+    const initial = new Map(
+      existingElements.map((element) => [
+        element.id,
+        element.properties as Record<string, unknown>,
+      ]),
+    );
     const virtual = new Map(initial);
     const lastRevision = new Map<string, bigint>();
     const writes: Array<{
@@ -130,13 +170,24 @@ export async function persistCanvasMutations(input: {
         continue;
       }
 
-      const shapeId = mutation.kind === "delete" ? mutation.elementId : String(mutation.element.id);
+      const shapeId =
+        mutation.kind === "delete"
+          ? mutation.elementId
+          : String(mutation.element.id);
       const before = virtual.get(elementId(canvas.canvasId, shapeId));
       const after = mutation.kind === "delete" ? undefined : mutation.element;
-      if (mutation.kind === "create" && before && stableJson(before) !== stableJson(after))
+      if (
+        mutation.kind === "create" &&
+        before &&
+        stableJson(before) !== stableJson(after)
+      )
         return { ...result(false, senderRole), conflict: true };
       if (stableJson(before) === stableJson(after)) {
-        results.push({ operationId: mutation.operationId, revision: Number(revision), unchanged: true });
+        results.push({
+          operationId: mutation.operationId,
+          revision: Number(revision),
+          unchanged: true,
+        });
         continue;
       }
 
@@ -144,23 +195,48 @@ export async function persistCanvasMutations(input: {
       lastRevision.set(shapeId, revision);
       if (after) virtual.set(elementId(canvas.canvasId, shapeId), after);
       else virtual.delete(elementId(canvas.canvasId, shapeId));
-      const payload = mutation.kind === "delete" ? { id: shapeId } : { element: mutation.element };
+      const payload =
+        mutation.kind === "delete"
+          ? { id: shapeId }
+          : { element: mutation.element };
       writes.push({
         operationId: mutation.operationId,
         revision,
-        kind: mutation.kind === "delete" ? "delete_element" : `${mutation.kind}_element`,
+        kind:
+          mutation.kind === "delete"
+            ? "delete_element"
+            : `${mutation.kind}_element`,
         payload,
       });
-      results.push({ operationId: mutation.operationId, revision: Number(revision) });
+      results.push({
+        operationId: mutation.operationId,
+        revision: Number(revision),
+      });
       operations.push({ ...mutation, revision: Number(revision) });
     }
 
     if (writes.length === 0)
-      return { allowed: true, role: senderRole, roles, revision: Number(revision), results, operations };
+      return {
+        allowed: true,
+        role: senderRole,
+        roles,
+        revision: Number(revision),
+        results,
+        operations,
+      };
 
     const toDelete: string[] = [];
-    const toCreate: Array<{ id: string; canvasId: number; revision: bigint; properties: Prisma.InputJsonValue }> = [];
-    const toUpdate: Array<{ id: string; revision: bigint; properties: Prisma.InputJsonValue }> = [];
+    const toCreate: Array<{
+      id: string;
+      canvasId: number;
+      revision: bigint;
+      properties: Prisma.InputJsonValue;
+    }> = [];
+    const toUpdate: Array<{
+      id: string;
+      revision: bigint;
+      properties: Prisma.InputJsonValue;
+    }> = [];
     for (const shapeId of touchedShapeIds) {
       const key = elementId(canvas.canvasId, shapeId);
       const before = initial.get(key);
@@ -184,9 +260,12 @@ export async function persistCanvasMutations(input: {
       data: { revision },
     });
     if (toDelete.length > 0) {
-      await tx.canvasElement.deleteMany({ where: { canvasId: canvas.canvasId, id: { in: toDelete } } });
+      await tx.canvasElement.deleteMany({
+        where: { canvasId: canvas.canvasId, id: { in: toDelete } },
+      });
     }
-    if (toCreate.length > 0) await tx.canvasElement.createMany({ data: toCreate });
+    if (toCreate.length > 0)
+      await tx.canvasElement.createMany({ data: toCreate });
     for (const element of toUpdate) {
       await tx.canvasElement.update({
         where: { id: element.id },
@@ -202,7 +281,14 @@ export async function persistCanvasMutations(input: {
       })),
     });
 
-    return { allowed: true, role: senderRole, roles, revision: Number(revision), results, operations };
+    return {
+      allowed: true,
+      role: senderRole,
+      roles,
+      revision: Number(revision),
+      results,
+      operations,
+    };
   });
 }
 
@@ -234,7 +320,10 @@ export async function getCanvasSync(roomId: number, afterRevision?: number) {
       expected += 1n;
       return true;
     });
-    if (contiguous && (rows.length === 501 || expected - 1n === canvas.revision)) {
+    if (
+      contiguous &&
+      (rows.length === 501 || expected - 1n === canvas.revision)
+    ) {
       const operations = rows.slice(0, 500).map((row) => ({
         operationId: row.operationId,
         revision: Number(row.revision),
@@ -245,7 +334,9 @@ export async function getCanvasSync(roomId: number, afterRevision?: number) {
         mode: "operations" as const,
         revision: operations.at(-1)?.revision ?? afterRevision,
         currentRevision,
-        hasMore: operations.length === 500 && operations.at(-1)!.revision < currentRevision,
+        hasMore:
+          operations.length === 500 &&
+          operations.at(-1)!.revision < currentRevision,
         operations,
       };
     }
@@ -264,7 +355,11 @@ export async function getCanvasSync(roomId: number, afterRevision?: number) {
     for (const row of history.reverse()) {
       try {
         const element = JSON.parse(row.message) as Record<string, unknown>;
-        if (element && typeof element.id === "string" && typeof element.type === "string")
+        if (
+          element &&
+          typeof element.id === "string" &&
+          typeof element.type === "string"
+        )
           byId.set(element.id, element);
       } catch {
         // Keep malformed legacy rows in Chat; skip only their canvas projection.
@@ -273,5 +368,10 @@ export async function getCanvasSync(roomId: number, afterRevision?: number) {
     elements = [...byId.values()] as Prisma.JsonValue[];
     legacy = elements.length > 0;
   }
-  return { mode: "snapshot" as const, revision: currentRevision, elements, legacy };
+  return {
+    mode: "snapshot" as const,
+    revision: currentRevision,
+    elements,
+    legacy,
+  };
 }

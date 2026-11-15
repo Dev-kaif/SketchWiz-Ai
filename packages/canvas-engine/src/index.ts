@@ -8,3 +8,4 @@ export * from "./resources.js";
 export * from "./input.js";
 export * from "./tools.js";
 export * from "./eraser.js";
+export * from "./manipulation.js";
