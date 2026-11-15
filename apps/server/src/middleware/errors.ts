@@ -1,7 +1,7 @@
 import type { ErrorRequestHandler } from "express";
 import { AppError } from "../errors.js";
 import { logger } from "@repo/backend/logger";
-export const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
+export const errorHandler: ErrorRequestHandler = (error, req, res, _next) => {
   void _next;
   if (error instanceof AppError) {
     res.status(error.status).json({ message: error.message, code: error.code });
@@ -43,8 +43,22 @@ export const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
       .json({ message: "Malformed JSON request", code: "INVALID_JSON" });
     return;
   }
+  const prismaError =
+    typeof error === "object" && error !== null && "code" in error
+      ? String(error.code)
+      : undefined;
+  const prismaTarget =
+    typeof error === "object" && error !== null && "meta" in error
+      ? (error.meta as { modelName?: unknown; target?: unknown } | undefined)
+      : undefined;
   logger.error("Unhandled HTTP error", {
     errorName: error instanceof Error ? error.name : "unknown",
+    ...(prismaError ? { errorCode: prismaError } : {}),
+    ...(prismaTarget?.modelName
+      ? { model: String(prismaTarget.modelName) }
+      : {}),
+    method: req.method,
+    path: req.originalUrl.split("?")[0],
   });
   res.status(500).json({ message: "Internal server error" });
 };
