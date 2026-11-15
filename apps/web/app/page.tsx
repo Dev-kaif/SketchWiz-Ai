@@ -20,9 +20,9 @@ import {
   BrainCircuit,
   Users,
   Paintbrush,
-  Twitter,
-  Github,
-  Linkedin,
+  MessageCircle,
+  Code2,
+  BriefcaseBusiness,
   ChevronRight,
   Plus,
   Minus,
@@ -496,7 +496,7 @@ const Footer = () => (
                   href="#"
                   className="text-[#b4b4b4] hover:text-white transition-colors"
                 >
-                  <Twitter size={20} />
+                  <MessageCircle size={20} />
                 </Link>
               </TooltipTrigger>
               <TooltipContent>
@@ -509,7 +509,7 @@ const Footer = () => (
                   href="#"
                   className="text-[#b4b4b4] hover:text-white transition-colors"
                 >
-                  <Github size={20} />
+                  <Code2 size={20} />
                 </Link>
               </TooltipTrigger>
               <TooltipContent>
@@ -522,7 +522,7 @@ const Footer = () => (
                   href="#"
                   className="text-[#b4b4b4] hover:text-white transition-colors"
                 >
-                  <Linkedin size={20} />
+                  <BriefcaseBusiness size={20} />
                 </Link>
               </TooltipTrigger>
               <TooltipContent>
