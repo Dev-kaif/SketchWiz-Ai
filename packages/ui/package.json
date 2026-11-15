@@ -4,11 +4,9 @@
   "private": true,
   "exports": {
     "./button": "./src/button.tsx",
-    "./input": "./src/input.tsx",
-    "./styles.css": "./dist/index.css"
+    "./input": "./src/input.tsx"
   },
   "scripts": {
-    "build": "tailwindcss -i ./src/styles.css -o ./dist/index.css",
     "check-types": "tsc --noEmit",
     "lint": "eslint src --max-warnings 0"
   },
