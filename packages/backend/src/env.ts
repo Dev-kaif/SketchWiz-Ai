@@ -5,7 +5,7 @@ const shared = z.object({
   DATABASE_URL: z.string().url().optional(),
   JWT_SECRET: z
     .string()
-    .min(6, "JWT_SECRET must be at least 6 characters")
+    .min(1, "JWT_SECRET must not be empty")
     .optional(),
   GEMINI_API_KEY: z.string().min(1).optional(),
   NODE_ENV: z
@@ -28,7 +28,7 @@ export const serverEnv = () => {
   const env = parse(
     shared.extend({
       DATABASE_URL: z.string().min(1),
-      JWT_SECRET: z.string().min(16),
+      JWT_SECRET: z.string().min(1),
       GEMINI_API_KEY: z.string().min(1),
       PORT: z.coerce.number().int().positive().default(5000),
       HOST: z.string().default("0.0.0.0"),
@@ -77,7 +77,7 @@ export const websocketEnv = () =>
   parse(
     shared.extend({
       DATABASE_URL: z.string().min(1),
-      JWT_SECRET: z.string().min(16),
+      JWT_SECRET: z.string().min(1),
       PORT: z.coerce.number().int().positive().default(8000),
       HOST: z.string().default("0.0.0.0"),
       WS_MAX_PAYLOAD_BYTES: z.coerce
