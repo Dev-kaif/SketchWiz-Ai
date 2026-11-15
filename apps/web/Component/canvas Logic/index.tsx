@@ -2,6 +2,7 @@
 /* eslint-disable no-case-declarations */
 import axios from "../axios/index";
 import { BACKEND_URL } from "../Config";
+import { Camera, CanvasRenderer, Scene, type CanvasElement } from "@repo/canvas-engine";
 
 type Point = { x: number; y: number };
 
@@ -129,6 +130,7 @@ interface InitDrawControls {
     bounds: { x: number; y: number; width: number; height: number };
   }>;
   deleteShapeById: (id: string) => void;
+  clearLocally: () => void;
   captureSelectedAreaBlob: () => Promise<Blob | null>;
 }
 
@@ -189,23 +191,34 @@ export default async function initDraw(
       isCanvasEmpty: () => true,
       getSelectedShapesInfo: () => [],
       deleteShapeById: () => {},
+      clearLocally: () => {},
       captureSelectedAreaBlob: () => Promise.resolve(null)
     };
   }
 
   // Consolidate all drawing variables in state.
   const state: DrawState = { ...defaultState };
+  const scene = new Scene();
+  const camera = new Camera();
+  const renderer = new CanvasRenderer(canvas, ctx, () => scheduleRender());
+  let renderedCamera = { x: Number.NaN, y: Number.NaN, zoom: Number.NaN };
+  const setSceneElement = (shape: Shape) => {
+    scene.set(shape as unknown as CanvasElement);
+    renderer.invalidateScene();
+  };
   let roomIdForSync: number | null = null;
   let canvasRevision = 0;
   let requestedSyncRevision: number | null = null;
 
   // Schedule rendering with requestAnimationFrame.
   let renderRequested = false;
+  let renderFrame = 0;
   function scheduleRender() {
     if (!renderRequested) {
       renderRequested = true;
-      requestAnimationFrame(() => {
+      renderFrame = requestAnimationFrame(() => {
         renderRequested = false;
+        renderFrame = 0;
         renderAll();
       });
     }
@@ -214,6 +227,7 @@ export default async function initDraw(
   // Add this new helper function inside initDraw, after `state` is defined
   function addShapeLocally(shape: Shape) {
     state.shapes.push(shape);
+    setSceneElement(shape);
     scheduleRender(); // Request a re-render to display the new shape
   }
 
@@ -221,7 +235,15 @@ export default async function initDraw(
     return state.shapes.length === 0;
   }
 
-  const imageCache: { [src: string]: HTMLImageElement } = {};
+  function clearLocally() {
+    state.shapes = [];
+    state.selectedShapeIds = [];
+    scene.clear();
+    renderer.invalidateScene();
+    scheduleRender();
+  }
+
+  const imageCache = new Map<string, HTMLImageElement>();
 
   function getShapeBounds(
     ctx: CanvasRenderingContext2D,
@@ -343,6 +365,8 @@ export default async function initDraw(
     const index = state.shapes.findIndex((s) => s.id === id);
     if (index !== -1) {
       state.shapes.splice(index, 1);
+      scene.delete(id);
+      renderer.invalidateScene();
       // If the deleted shape was selected, clear selection or adjust index
       state.selectedShapeIds = state.selectedShapeIds.filter(
         (selectedId) => selectedId !== id
@@ -425,7 +449,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
               tempCtx.save();
               tempCtx.lineJoin = "round";
               tempCtx.lineCap = "round";
-              tempCtx.shadowBlur = 2; // Match original drawing style
+              tempCtx.shadowBlur = 0;
               drawFn(tempCtx, shape);
               tempCtx.restore();
           }
@@ -578,7 +602,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
       ctx: CanvasRenderingContext2D,
       shape: Extract<Shape, { type: "image" }>
     ) => {
-      let img = imageCache[shape.src];
+      let img = imageCache.get(shape.src);
       if (!img) {
         img = new Image();
         img.crossOrigin = "anonymous"; // Important for CORS if images are from external sources
@@ -591,7 +615,8 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
           // You might want to draw a placeholder or log an error
         };
         img.src = shape.src;
-        imageCache[shape.src] = img; // Cache the image for future use
+        imageCache.set(shape.src, img);
+        if (imageCache.size > 128) imageCache.delete(imageCache.keys().next().value!);
       }
 
       // Draw only if the image is loaded and ready
@@ -606,39 +631,18 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
   // --------------------------------------------------
   function renderAll() {
     if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    camera.x = state.offsetX;
+    camera.y = state.offsetY;
+    camera.zoom = state.scale;
+    if (camera.x !== renderedCamera.x || camera.y !== renderedCamera.y || camera.zoom !== renderedCamera.zoom) {
+      renderer.invalidateScene();
+      renderedCamera = { x: camera.x, y: camera.y, zoom: camera.zoom };
+    }
+    renderer.render(scene, camera, new Set(state.selectedShapeIds), new Map());
     ctx.save();
 
     ctx.translate(state.offsetX, state.offsetY);
     ctx.scale(state.scale, state.scale);
-
-    // 1. Draw saved shapes.
-    state.shapes.forEach((shape) => {
-      ctx.save();
-      ctx.lineJoin = "round";
-      ctx.lineCap = "round";
-      ctx.shadowBlur = 2;
-      const drawFn = (drawShape as any)[shape.type];
-      if (drawFn) {
-        drawFn(ctx, shape);
-      }
-      ctx.restore();
-    });
-
-    state.selectedShapeIds.forEach((selectedId) => {
-      const selectedShape = state.shapes.find((s) => s.id === selectedId);
-      if (selectedShape) {
-        const bounds = getShapeBounds(ctx, selectedShape);
-        if (bounds) {
-          ctx.save();
-          ctx.strokeStyle = "#00aaff"; // Highlight color
-          ctx.lineWidth = 2 / state.scale; // Make sure line width scales inversely with zoom
-          ctx.setLineDash([5, 5]); // Dashed line
-          ctx.strokeRect(bounds.x, bounds.y, bounds.width, bounds.height);
-          ctx.restore();
-        }
-      }
-    });
 
     // NEW: Draw marquee selection rectangle
     if (
@@ -776,6 +780,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     const index = state.shapes.findIndex((current) => current.id === shape.id);
     if (index === -1) state.shapes.push(shape);
     else state.shapes[index] = shape;
+    setSceneElement(shape);
   }
 
   function requestCanvasSync() {
@@ -800,10 +805,16 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     const payload = operation.payload;
     if (type === "canvas:clear" || type === "clear") {
       state.shapes = [];
+      scene.clear();
+      renderer.invalidateScene();
     } else if (["canvas:delete", "canvas:delete_element", "delete_element"].includes(type)) {
       const id = operation.elementId ?? payload?.id;
       if (typeof id === "string")
         state.shapes = state.shapes.filter((shape) => shape.id !== id);
+      if (typeof id === "string") {
+        scene.delete(id);
+        renderer.invalidateScene();
+      }
     } else {
       const element = operation.element ?? payload?.element ?? payload;
       if (element && typeof element.id === "string" && typeof element.type === "string")
@@ -824,6 +835,9 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
       requestedSyncRevision = null;
       if (data.mode === "snapshot") {
         state.shapes = Array.isArray(data.elements) ? data.elements as Shape[] : [];
+        scene.clear();
+        renderer.invalidateScene();
+        for (const shape of state.shapes) setSceneElement(shape);
         canvasRevision = Number(data.revision) || 0;
         scheduleRender();
       } else if (data.mode === "operations" && Array.isArray(data.operations)) {
@@ -865,6 +879,9 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     roomIdForSync = roomId;
     const res = await axios.get(`${BACKEND_URL}/api/room/${roomId}/canvas`);
     state.shapes = Array.isArray(res.data.elements) ? res.data.elements as Shape[] : [];
+    scene.clear();
+    renderer.invalidateScene();
+    for (const shape of state.shapes) setSceneElement(shape);
     canvasRevision = Number(res.data.revision) || 0;
     scheduleRender();
     socket.send(JSON.stringify({ type: "join_room", roomId }));
@@ -959,10 +976,12 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     if(!ctx)return;
     let clickedShapeId: string | null = null;
     // Iterate backwards to find the topmost shape that was clicked
-    for (let i = state.shapes.length - 1; i >= 0; i--) {
-      const shape = state.shapes[i];
+    const tolerance = 8 / state.scale;
+    const candidates = scene.query({ minX: worldX-tolerance, minY: worldY-tolerance, maxX: worldX+tolerance, maxY: worldY+tolerance });
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      const shape = candidates[i];
       if (shape) { // Type guard for safety
-        const bounds = getShapeBounds(ctx, shape); 
+        const bounds = getShapeBounds(ctx, shape as unknown as Shape);
         if (
           bounds &&
           worldX >= bounds.x && worldX <= bounds.x + bounds.width &&
@@ -1116,6 +1135,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
         strokeWidth: strokeWidthRef.current,
       };
       state.shapes.push(newShape);
+      setSceneElement(newShape);
       sendShapeMessage(newShape);
     }
     state.freehandPoints = [];
@@ -1133,6 +1153,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
         size: strokeWidthRef.current * 10,
       };
       state.shapes.push(newShape);
+      setSceneElement(newShape);
       sendShapeMessage(newShape);
     }
     state.eraserPoints = [];
@@ -1219,6 +1240,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
   
     if (newShape) {
       state.shapes.push(newShape);
+      setSceneElement(newShape);
       sendShapeMessage(newShape);
     }
     state.currentX = undefined;
@@ -1249,8 +1271,8 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     }
   
     // Add shapes that intersect with the marquee selection
-    state.shapes.forEach((shape) => {
-      const shapeBounds = getShapeBounds(ctx,shape);
+    scene.query({ minX: marqueeBounds.x, minY: marqueeBounds.y, maxX: marqueeBounds.x + marqueeBounds.width, maxY: marqueeBounds.y + marqueeBounds.height }).forEach((shape) => {
+      const shapeBounds = getShapeBounds(ctx,shape as unknown as Shape);
       if (shapeBounds) {
         // Check for intersection between marqueeBounds and shapeBounds
         if (
@@ -1279,12 +1301,8 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
   // Wheel (zoom) handler.
   function handleWheel(e: WheelEvent) {
     e.preventDefault();
-    const zoomIntensity = 0.001;
-    let newScale = state.scale - e.deltaY * zoomIntensity;
-    const minScale = 0.4;
-    const maxScale = 1;
-    newScale = Math.max(newScale, minScale);
-    newScale = Math.min(newScale, maxScale);
+    let newScale = state.scale * Math.exp(-e.deltaY * 0.001);
+    newScale = Math.max(0.05, Math.min(64, newScale));
     const rect = canvas.getBoundingClientRect();
     const mouseX = e.clientX - rect.left;
     const mouseY = e.clientY - rect.top;
@@ -1361,6 +1379,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
           strokeWidth: strokeWidthRef.current,
         };
         state.shapes.push(newShape);
+        setSceneElement(newShape);
         sendShapeMessage(newShape);
       }
       state.textPreview = undefined;
@@ -1381,6 +1400,8 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
   canvas.addEventListener("mouseup", handleMouseUp);
   canvas.addEventListener("wheel", handleWheel);
   canvas.addEventListener("dblclick", handleDoubleClick);
+  const handleWindowResize = () => scheduleRender();
+  window.addEventListener("resize", handleWindowResize);
 
   // Initial render.
   scheduleRender();
@@ -1392,6 +1413,12 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
       canvas.removeEventListener("mouseup", handleMouseUp);
       canvas.removeEventListener("wheel", handleWheel);
       canvas.removeEventListener("dblclick", handleDoubleClick);
+      window.removeEventListener("resize", handleWindowResize);
+      imageCache.clear();
+      if (renderFrame) cancelAnimationFrame(renderFrame);
+      renderFrame = 0;
+      renderRequested = false;
+      renderer.dispose();
       if (activeTextCleanup) {
         activeTextCleanup();
       }
@@ -1400,6 +1427,7 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
     isCanvasEmpty: isCanvasEmpty,
     getSelectedShapesInfo: getSelectedShapesInfo, 
     deleteShapeById: deleteShapeById,
+    clearLocally,
     captureSelectedAreaBlob: captureSelectedAreaBlob,
   };
 }

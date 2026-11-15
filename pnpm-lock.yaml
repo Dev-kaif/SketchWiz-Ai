@@ -293,6 +293,9 @@ importers:
       "@repo/ui":
         specifier: workspace:*
         version: link:../../packages/ui
+      "@repo/canvas-engine":
+        specifier: workspace:*
+        version: link:../../packages/canvas-engine
       axios:
         specifier: ^1.21.1
         version: 1.21.1
@@ -422,6 +425,22 @@ importers:
       "@repo/typescript-config":
         specifier: workspace:*
         version: link:../typescript-config
+
+  packages/canvas-engine:
+    dependencies:
+      "@repo/typescript-config":
+        specifier: workspace:*
+        version: link:../typescript-config
+      rbush:
+        specifier: ^4.0.1
+        version: 4.0.1
+    devDependencies:
+      "@types/rbush":
+        specifier: ^4.0.0
+        version: 4.0.0
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
 
   packages/db:
     dependencies:
@@ -2609,6 +2628,12 @@ packages:
     resolution:
       {
         integrity: sha512-hKormJbkJqzQGhziax5PItDUTMAM9uE2XXQmM37dyd4hVM+5aVl7oVxMVUiVQn2oCQFN/LKCZdvSM0pFRqbSmQ==,
+      }
+
+  "@types/rbush@4.0.0":
+    resolution:
+      {
+        integrity: sha512-+N+2H39P8X+Hy1I5mC6awlTX54k3FhiUmvt7HWzGJZvF+syUAAxP/stwppS8JE84YHqFgRMv6fCy31202CMFxQ==,
       }
 
   "@types/react-dom@19.3.0":
@@ -5914,6 +5939,12 @@ packages:
       }
     engines: { node: ">= 0.10" }
 
+  rbush@4.0.1:
+    resolution:
+      {
+        integrity: sha512-IP0UpfeWQujYC8Jg162rMNc01Rf0gWMMAb2Uxus/Q0qOFw4lCcq6ZnQEZwUoJqWyUGJ9th7JjwI4yIWo+uvoAQ==,
+      }
+
   rc9@3.1.0:
     resolution:
       {
@@ -8155,6 +8186,8 @@ snapshots:
 
   "@types/range-parser@1.2.7": {}
 
+  "@types/rbush@4.0.0": {}
+
   "@types/react-dom@19.3.0(@types/react@19.3.0)":
     dependencies:
       "@types/react": 19.3.0
@@ -10243,6 +10276,10 @@ snapshots:
       http-errors: 2.0.1
       iconv-lite: 0.7.3
       unpipe: 1.0.0
+
+  rbush@4.0.1:
+    dependencies:
+      quickselect: 3.0.0
 
   rc9@3.1.0:
     dependencies:

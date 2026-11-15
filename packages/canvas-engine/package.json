@@ -1,0 +1,23 @@
+{
+  "name": "@repo/canvas-engine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "check-types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@repo/typescript-config": "workspace:*",
+    "rbush": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/rbush": "^4.0.0",
+    "typescript": "6.0.3"
+  }
+}

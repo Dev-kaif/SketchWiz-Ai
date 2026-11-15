@@ -51,7 +51,7 @@ const Page = ({ params }: Param) => {
     width: number;
     height: number;
   } | null>(null);
-  const [callDelete, setCallDelete] = useState(false);
+
   const { addNotification } = useNotification();
   // Stroke settings (default: white & 3)
   const [strokeColor, setStrokeColor] = useState("#ffffff");
@@ -61,7 +61,6 @@ const Page = ({ params }: Param) => {
   const [aiResponse, setAiResponse] = useState<string | null>(null);
   const [runningAi, setRunningAi] = useState(false);
   const [improvingAi, setImprovingAi] = useState(false);
-  const [imageURL, setImageURL] = useState<string | null>(null);
 
   // Refs to hold dynamic stroke settings so they’re used in drawing operations.
   const strokeColorRef = useRef(strokeColor);
@@ -123,7 +122,7 @@ const Page = ({ params }: Param) => {
             headers: {
               "Content-Type": "multipart/form-data",
             },
-          }
+          },
         );
 
         // Store the first analysis result as a string in state.
@@ -153,6 +152,7 @@ const Page = ({ params }: Param) => {
           bounds: { x: number; y: number; width: number; height: number };
         }>;
         deleteShapeById: (id: string) => void;
+        clearLocally: () => void;
         captureSelectedAreaBlob: () => Promise<Blob | null>;
       }
     | undefined
@@ -195,7 +195,7 @@ const Page = ({ params }: Param) => {
           formData,
           {
             responseType: "arraybuffer",
-          }
+          },
         );
 
         // Convert arraybuffer to base64 string
@@ -243,12 +243,14 @@ const Page = ({ params }: Param) => {
 
         // Send over socket
         if (socket && roomId) {
-          socket.send(JSON.stringify({
-            type: "canvas:create",
-            roomId,
-            operationId: crypto.randomUUID(),
-            element: newImageShape,
-          }));
+          socket.send(
+            JSON.stringify({
+              type: "canvas:create",
+              roomId,
+              operationId: crypto.randomUUID(),
+              element: newImageShape,
+            }),
+          );
         } else {
           console.warn("Socket or Room ID not available.");
         }
@@ -261,10 +263,6 @@ const Page = ({ params }: Param) => {
     });
   };
 
-
-
-
-  
   // Helper to convert ArrayBuffer to Base64
   function arrayBufferToBase64(buffer: ArrayBuffer) {
     let binary = "";
@@ -311,7 +309,7 @@ const Page = ({ params }: Param) => {
   useEffect(() => {
     const canvas = canvasRef.current;
     let cancelled = false;
-    if (canvas && dimensions) {
+    if (canvas) {
       (async () => {
         if (!socket) return;
         const controls = await initDraw(
@@ -322,7 +320,7 @@ const Page = ({ params }: Param) => {
           strokeWidthRef,
           socket,
           params,
-          setAiResponse
+          setAiResponse,
         );
         if (!cancelled) {
           cleanupRef.current = controls; // Store the controls object
@@ -338,7 +336,7 @@ const Page = ({ params }: Param) => {
         cleanupRef.current = undefined;
       }
     };
-  }, [dimensions, eraserSize, params, callDelete, socket]);
+  }, [params, socket]);
 
   // Update the eraser cursor position.
   useEffect(() => {
@@ -374,13 +372,12 @@ const Page = ({ params }: Param) => {
       const res = await axios.get(`${BACKEND_URL}/api/room/slug/${slug}`);
       const roomId = res.data.room.id;
       const delResponse = await axios.delete(
-        `${BACKEND_URL}/api/room/delete/content/${roomId}`
+        `${BACKEND_URL}/api/room/delete/content/${roomId}`,
       );
       addNotification("success", delResponse.data.message);
+      cleanupRef.current?.clearLocally();
     } catch (error: any) {
       addNotification("error", error.response?.data?.message || "");
-    } finally {
-      setCallDelete((prev) => !prev);
     }
   }
 
@@ -498,6 +495,7 @@ const Page = ({ params }: Param) => {
         width={dimensions.width}
         height={dimensions.height}
         className="absolute top-0 left-0 bg-black"
+        style={{ width: "100vw", height: "100vh" }}
       />
       {/* Eraser Cursor Overlay */}
       <div
@@ -517,7 +515,7 @@ const Page = ({ params }: Param) => {
       {/* Drawing Mode Toolbar */}
       <div className="absolute z-40 top-4 left-1/2 transform -translate-x-1/2 flex items-center space-x-3 px-4 py-2 rounded-full bg-gray-900 border border-gray-700 shadow-md">
         {[
-          { name: "select", symbol: <img src={'/cursor.png'}/> },
+          { name: "select", symbol: <img src={"/cursor.png"} /> },
           { name: "rect", symbol: <RectangleHorizontal /> },
           { name: "circle", symbol: <Circle /> },
           { name: "line", symbol: <Minus /> },

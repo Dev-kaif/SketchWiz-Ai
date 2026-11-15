@@ -1,0 +1,1 @@
+{"root":["./src/camera.ts","./src/elements.ts","./src/engine.ts","./src/geometry.ts","./src/index.ts","./src/input.ts","./src/renderer.ts","./src/resources.ts","./src/scene.ts"],"version":"6.0.3"}
