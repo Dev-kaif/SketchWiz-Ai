@@ -19,6 +19,10 @@ import {
   Play,
   TextCursor,
   Scissors,
+  ZoomIn,
+  ZoomOut,
+  Undo2,
+  Redo2,
 } from "lucide-react";
 import useSocket from "../../../Component/socket/useSocket";
 import axios from "axios";
@@ -44,6 +48,16 @@ interface Param {
   params: Promise<{ slug: string }>;
 }
 
+type CanvasViewport = {
+  zoom: number;
+  offsetX: number;
+  offsetY: number;
+  width: number;
+  height: number;
+  content: { minX: number; minY: number; maxX: number; maxY: number } | null;
+  items: Array<{ minX: number; minY: number; maxX: number; maxY: number }>;
+};
+
 const Page = ({ params }: Param) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const eraserCursorRef = useRef<HTMLDivElement>(null);
@@ -53,6 +67,7 @@ const Page = ({ params }: Param) => {
     width: number;
     height: number;
   } | null>(null);
+  const [viewport, setViewport] = useState<CanvasViewport | null>(null);
 
   const { addNotification } = useNotification();
   // Stroke settings (default: white & 3)
@@ -72,6 +87,41 @@ const Page = ({ params }: Param) => {
   const router = useRouter();
   const socket = useSocket();
   const [roomId, setRoomId] = useState();
+
+  useEffect(() => {
+    let lastUpdate = 0;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let latest: CanvasViewport | undefined;
+    const onViewport = (event: Event) => {
+      latest = (event as CustomEvent<CanvasViewport>).detail;
+      const elapsed = performance.now() - lastUpdate;
+      if (elapsed >= 80) {
+        lastUpdate = performance.now();
+        setViewport(latest);
+      } else if (!timeout) {
+        timeout = setTimeout(() => {
+          if (latest) setViewport(latest);
+          lastUpdate = performance.now();
+          timeout = undefined;
+        }, 80 - elapsed);
+      }
+    };
+    window.addEventListener("canvas:viewport", onViewport);
+    return () => {
+      window.removeEventListener("canvas:viewport", onViewport);
+      if (timeout) clearTimeout(timeout);
+    };
+  }, []);
+
+  useEffect(() => {
+    const onToolChange = (event: Event) => {
+      const nextMode = (event as CustomEvent<DrawingMode>).detail;
+      modeRef.current = nextMode;
+      setMode(nextMode);
+    };
+    window.addEventListener("canvas:tool-change", onToolChange);
+    return () => window.removeEventListener("canvas:tool-change", onToolChange);
+  }, []);
 
   useEffect(() => {
     async function getRoomId() {
@@ -174,6 +224,9 @@ const Page = ({ params }: Param) => {
             | "backward"
             | "delete",
         ) => void;
+        setZoom: (zoom: number) => void;
+        zoomBy: (factor: number) => void;
+        setViewportCenter: (x: number, y: number) => void;
         clearLocally: () => void;
         captureSelectedAreaBlob: () => Promise<Blob | null>;
       }
@@ -419,6 +472,56 @@ const Page = ({ params }: Param) => {
     }
   }
 
+  const minimap = (() => {
+    if (!viewport) return null;
+    const zoom = Math.max(0.001, viewport.zoom);
+    const visible = {
+      minX: -viewport.offsetX / zoom,
+      minY: -viewport.offsetY / zoom,
+      maxX: (viewport.width - viewport.offsetX) / zoom,
+      maxY: (viewport.height - viewport.offsetY) / zoom,
+    };
+    const world = {
+      minX: Math.min(viewport.content?.minX ?? visible.minX, visible.minX),
+      minY: Math.min(viewport.content?.minY ?? visible.minY, visible.minY),
+      maxX: Math.max(viewport.content?.maxX ?? visible.maxX, visible.maxX),
+      maxY: Math.max(viewport.content?.maxY ?? visible.maxY, visible.maxY),
+    };
+    const worldWidth = Math.max(1, world.maxX - world.minX);
+    const worldHeight = Math.max(1, world.maxY - world.minY);
+    const scale = Math.min(204 / worldWidth, 104 / worldHeight);
+    const mapWidth = worldWidth * scale;
+    const mapHeight = worldHeight * scale;
+    const originX = (220 - mapWidth) / 2;
+    const originY = (120 - mapHeight) / 2;
+    const point = (x: number, y: number) => ({
+      x: originX + (x - world.minX) * scale,
+      y: originY + (y - world.minY) * scale,
+    });
+    const rect = (bounds: CanvasViewport["content"]) => {
+      if (!bounds) return null;
+      const a = point(bounds.minX, bounds.minY);
+      const b = point(bounds.maxX, bounds.maxY);
+      return {
+        x: a.x,
+        y: a.y,
+        width: Math.max(1.2, b.x - a.x),
+        height: Math.max(1.2, b.y - a.y),
+      };
+    };
+    const visibleRect = rect(visible)!;
+    const centerAt = (event: React.PointerEvent<SVGSVGElement>) => {
+      const bounds = event.currentTarget.getBoundingClientRect();
+      const x = ((event.clientX - bounds.left) / bounds.width) * 220;
+      const y = ((event.clientY - bounds.top) / bounds.height) * 120;
+      cleanupRef.current?.setViewportCenter(
+        world.minX + (x - originX) / scale,
+        world.minY + (y - originY) / scale,
+      );
+    };
+    return { visibleRect, rect, centerAt, items: viewport.items };
+  })();
+
   return (
     <div className="relative">
       {/* AI Response Overlay at Bottom Right */}
@@ -443,6 +546,89 @@ const Page = ({ params }: Param) => {
       >
         <SettingsIcon size={24} />
       </button>
+      <section className="fixed bottom-4 left-4 z-40 w-[260px] rounded-xl border border-gray-700 bg-gray-900/95 p-3 text-gray-200 shadow-xl backdrop-blur">
+        <svg
+          viewBox="0 0 220 120"
+          className="h-[130px] w-full touch-none rounded-lg bg-black/70"
+          role="img"
+          aria-label="Canvas minimap. Drag to move the viewport."
+          onPointerDown={(event) => {
+            event.currentTarget.setPointerCapture(event.pointerId);
+            minimap?.centerAt(event);
+          }}
+          onPointerMove={(event) => {
+            if (event.buttons) minimap?.centerAt(event);
+          }}
+        >
+          {minimap?.items.map((bounds, index) => {
+            const rect = minimap.rect(bounds);
+            return rect ? (
+              <rect
+                key={index}
+                {...rect}
+                rx="0.8"
+                fill="#8892a6"
+                opacity="0.65"
+              />
+            ) : null;
+          })}
+          {minimap && (
+            <rect
+              {...minimap.visibleRect}
+              rx="1.5"
+              fill="#6366f1"
+              fillOpacity="0.12"
+              stroke="#818cf8"
+              strokeWidth="1.5"
+            />
+          )}
+        </svg>
+        <div className="mt-2 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1 rounded-lg bg-gray-800 px-1">
+            <button
+              title="Zoom out"
+              aria-label="Zoom out"
+              className="rounded p-1.5 hover:bg-gray-700"
+              onClick={() => cleanupRef.current?.zoomBy(1 / 1.2)}
+            >
+              <ZoomOut size={16} />
+            </button>
+            <button
+              title="Reset zoom to 100%"
+              className="min-w-12 px-1 text-sm tabular-nums hover:text-white"
+              onClick={() => cleanupRef.current?.setZoom(1)}
+            >
+              {Math.round((viewport?.zoom ?? 1) * 100)}%
+            </button>
+            <button
+              title="Zoom in"
+              aria-label="Zoom in"
+              className="rounded p-1.5 hover:bg-gray-700"
+              onClick={() => cleanupRef.current?.zoomBy(1.2)}
+            >
+              <ZoomIn size={16} />
+            </button>
+          </div>
+          <div className="flex items-center gap-1 rounded-lg bg-gray-800 px-1">
+            <button
+              title="Undo"
+              aria-label="Undo"
+              className="rounded p-1.5 hover:bg-gray-700"
+              onClick={() => cleanupRef.current?.runCanvasCommand("undo")}
+            >
+              <Undo2 size={16} />
+            </button>
+            <button
+              title="Redo"
+              aria-label="Redo"
+              className="rounded p-1.5 hover:bg-gray-700"
+              onClick={() => cleanupRef.current?.runCanvasCommand("redo")}
+            >
+              <Redo2 size={16} />
+            </button>
+          </div>
+        </div>
+      </section>
       <div className="absolute z-30 top-4 right-4 gap-3 flex items-center">
         <button
           onClick={() => handleImprove()}

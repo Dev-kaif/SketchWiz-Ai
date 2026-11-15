@@ -19,11 +19,14 @@ import {
   splitFreehand,
   sweptIntersects,
   traceFreehand,
+  boundsOf,
   type CanvasElement,
   type ToolPoint,
 } from "@repo/canvas-engine";
 
 type Point = { x: number; y: number; pressure?: number };
+const MIN_CANVAS_ZOOM = 0.1;
+const MAX_CANVAS_ZOOM = 4;
 
 type ShapeStyle = {
   strokeColor?: string;
@@ -178,6 +181,9 @@ interface InitDrawControls {
       | "backward"
       | "delete",
   ) => void;
+  setZoom: (zoom: number) => void;
+  zoomBy: (factor: number) => void;
+  setViewportCenter: (x: number, y: number) => void;
   clearLocally: () => void;
   captureSelectedAreaBlob: () => Promise<Blob | null>;
 }
@@ -242,6 +248,9 @@ export default async function initDraw(
       deleteShapeById: () => {},
       editSelectionStyle: () => {},
       runCanvasCommand: () => {},
+      setZoom: () => {},
+      zoomBy: () => {},
+      setViewportCenter: () => {},
       clearLocally: () => {},
       captureSelectedAreaBlob: () => Promise.resolve(null),
     };
@@ -263,6 +272,10 @@ export default async function initDraw(
   let pointerToolActive = false;
   let activePointerTool: "freehand" | "eraser" | "precision-eraser" | null =
     null;
+  let panKeyDown = false;
+  let safariGestureStartScale: number | null = null;
+  let zoomAnimationFrame = 0;
+  let zoomAnimationTarget = state.scale;
   const history = new CommandHistory(100);
   const transformPreviews = new Map<string, CanvasElement>();
   const hiddenTransformIds = new Set<string>();
@@ -744,9 +757,35 @@ export default async function initDraw(
       transformPreviews,
       hiddenTransformIds,
     );
+    const rect = canvas.getBoundingClientRect();
+    const elements = scene.all();
+    const stride = Math.max(1, Math.ceil(elements.length / 300));
+    const itemBounds = elements
+      .filter((_, index) => index % stride === 0)
+      .map(boundsOf);
+    const bounds = itemBounds.length
+      ? {
+          minX: Math.min(...itemBounds.map((item) => item.minX)),
+          minY: Math.min(...itemBounds.map((item) => item.minY)),
+          maxX: Math.max(...itemBounds.map((item) => item.maxX)),
+          maxY: Math.max(...itemBounds.map((item) => item.maxY)),
+        }
+      : null;
+    window.dispatchEvent(
+      new CustomEvent("canvas:viewport", {
+        detail: {
+          zoom: state.scale,
+          offsetX: state.offsetX,
+          offsetY: state.offsetY,
+          width: rect.width,
+          height: rect.height,
+          content: bounds,
+          items: itemBounds,
+        },
+      }),
+    );
     ctx.save();
 
-    const rect = canvas.getBoundingClientRect();
     const pixelRatio = canvas.width / Math.max(1, rect.width);
     ctx.setTransform(
       pixelRatio * state.scale,
@@ -1229,6 +1268,7 @@ export default async function initDraw(
     canvas,
     {
       enabled: () =>
+        !panKeyDown &&
         ["freehand", "eraser", "precision-eraser"].includes(
           modeRef.current ?? "",
         ),
@@ -1284,16 +1324,17 @@ export default async function initDraw(
 
   //  new chnages
 
+  const isDrawingTool = () =>
+    ["freehand", "eraser", "precision-eraser"].includes(modeRef.current ?? "");
+
   function handleMouseDown(e: MouseEvent) {
-    if (
-      pointerToolActive ||
-      ["freehand", "eraser", "precision-eraser"].includes(modeRef.current ?? "")
-    )
+    const drawingTool = isDrawingTool();
+    if (pointerToolActive || (drawingTool && e.button === 0 && !panKeyDown))
       return;
     // `ctx` is guaranteed non-null here due to the initial check in initDraw
     const { x: worldX, y: worldY } = clientToWorld(e.clientX, e.clientY);
     if (activeTransform) return;
-    const isCtrlOrCmdPressed = e.ctrlKey || e.metaKey;
+    const isCtrlOrCmdPressed = e.ctrlKey || e.metaKey || e.shiftKey;
 
     // 1. Handle active text preview (highest priority as it's an overlay)
     if (state.textPreview && modeRef.current === "text") {
@@ -1301,14 +1342,15 @@ export default async function initDraw(
       return;
     }
 
-    // 2. Handle right-click for panning (second highest priority)
-    if (e.button === 2) {
+    // Space + drag, middle drag, and right drag pan like Excalidraw.
+    if (e.button === 1 || e.button === 2 || (e.button === 0 && panKeyDown)) {
+      cancelZoomAnimation();
+      e.preventDefault();
       state.isPanning = true;
       const point = clientToCanvas(e.clientX, e.clientY);
       state.panStartX = point.x - state.offsetX;
       state.panStartY = point.y - state.offsetY;
-      state.selectedShapeIds = []; // Clear selection on pan start
-      state.isMarqueeSelecting = false; // Ensure marquee is off
+      canvas.style.cursor = "grabbing";
       scheduleRender();
       return;
     }
@@ -1559,7 +1601,7 @@ export default async function initDraw(
   function handleMouseMove(e: MouseEvent) {
     if (
       pointerToolActive ||
-      ["freehand", "eraser", "precision-eraser"].includes(modeRef.current ?? "")
+      (isDrawingTool() && !panKeyDown && !state.isPanning)
     )
       return;
     const { x: worldX, y: worldY } = clientToWorld(e.clientX, e.clientY);
@@ -1569,17 +1611,17 @@ export default async function initDraw(
     }
 
     // Prioritize active drawing/panning states
-    if (state.isErasing) {
+    if (state.isPanning) {
+      const point = clientToCanvas(e.clientX, e.clientY);
+      state.offsetX = point.x - state.panStartX;
+      state.offsetY = point.y - state.panStartY;
+    } else if (state.isErasing) {
       state.eraserPoints.push({ x: worldX, y: worldY });
     } else if (state.isFreehandDrawing) {
       state.freehandPoints.push({ x: worldX, y: worldY });
     } else if (state.isDrawing) {
       state.currentX = worldX;
       state.currentY = worldY;
-    } else if (state.isPanning) {
-      const point = clientToCanvas(e.clientX, e.clientY);
-      state.offsetX = point.x - state.panStartX;
-      state.offsetY = point.y - state.panStartY;
     } else if (modeRef.current === "select" && state.isMarqueeSelecting) {
       state.marqueeCurrentX = worldX;
       state.marqueeCurrentY = worldY;
@@ -1594,7 +1636,7 @@ export default async function initDraw(
   function handleMouseUp(e: MouseEvent) {
     if (
       pointerToolActive ||
-      ["freehand", "eraser", "precision-eraser"].includes(modeRef.current ?? "")
+      (isDrawingTool() && !panKeyDown && !state.isPanning)
     )
       return;
     // `ctx` is guaranteed non-null here due to the initial check in initDraw
@@ -1603,12 +1645,11 @@ export default async function initDraw(
       finishTransform();
       return;
     }
-    const isCtrlOrCmdPressed = e.ctrlKey || e.metaKey;
+    const isCtrlOrCmdPressed = e.ctrlKey || e.metaKey || e.shiftKey;
 
-    // 1. Handle right-click for ending panning
-    if (e.button === 2 && state.isPanning) {
+    if (state.isPanning) {
       state.isPanning = false;
-      // No scheduleRender needed here, as mousemove already did it on last pan
+      canvas.style.cursor = "";
       return;
     }
 
@@ -1934,16 +1975,142 @@ export default async function initDraw(
   // Wheel (zoom) handler.
   function handleWheel(e: WheelEvent) {
     e.preventDefault();
-    let newScale = state.scale * Math.exp(-e.deltaY * 0.001);
-    newScale = Math.max(0.05, Math.min(64, newScale));
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey) {
+      cancelZoomAnimation();
+      state.offsetY -= e.deltaY;
+    } else if (e.ctrlKey || e.metaKey) {
+      zoomAtPointer(e);
+    } else if (e.shiftKey) {
+      cancelZoomAnimation();
+      state.offsetX -= e.deltaY || e.deltaX;
+    } else {
+      // Plain two-finger trackpad scrolling must never alter zoom.
+      cancelZoomAnimation();
+      state.offsetX -= e.deltaX;
+      state.offsetY -= e.deltaY;
+    }
+    scheduleRender();
+  }
+
+  function zoomAtPointer(e: WheelEvent) {
     const rect = canvas.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
+    animateZoomBy(
+      Math.exp(-e.deltaY * 0.03),
+      e.clientX - rect.left,
+      e.clientY - rect.top,
+    );
+  }
+
+  function animateZoomBy(factor: number, screenX: number, screenY: number) {
+    const baseScale = zoomAnimationFrame ? zoomAnimationTarget : state.scale;
+    animateZoomAt(baseScale * factor, screenX, screenY);
+  }
+
+  function animateZoomAt(
+    requestedScale: number,
+    screenX: number,
+    screenY: number,
+  ) {
+    cancelZoomAnimation();
+    const fromScale = state.scale;
+    const targetScale = Math.max(
+      MIN_CANVAS_ZOOM,
+      Math.min(MAX_CANVAS_ZOOM, requestedScale),
+    );
+    if (Math.abs(targetScale - fromScale) < 0.0001) return;
+    const worldX = (screenX - state.offsetX) / fromScale;
+    const worldY = (screenY - state.offsetY) / fromScale;
+    const startTime = performance.now();
+    const duration = 180;
+    zoomAnimationTarget = targetScale;
+
+    const step = (now: number) => {
+      const progress = Math.min(1, (now - startTime) / duration);
+      const eased = 1 - (1 - progress) ** 3;
+      state.scale = fromScale + (targetScale - fromScale) * eased;
+      state.offsetX = screenX - worldX * state.scale;
+      state.offsetY = screenY - worldY * state.scale;
+      scheduleRender();
+      if (progress < 1) zoomAnimationFrame = requestAnimationFrame(step);
+      else {
+        state.scale = targetScale;
+        zoomAnimationFrame = 0;
+      }
+    };
+    zoomAnimationFrame = requestAnimationFrame(step);
+  }
+
+  function cancelZoomAnimation() {
+    if (zoomAnimationFrame) cancelAnimationFrame(zoomAnimationFrame);
+    zoomAnimationFrame = 0;
+    zoomAnimationTarget = state.scale;
+  }
+
+  function zoomAtScreenPoint(
+    mouseX: number,
+    mouseY: number,
+    requestedScale: number,
+  ) {
+    cancelZoomAnimation();
+    const nextScale = Math.max(
+      MIN_CANVAS_ZOOM,
+      Math.min(MAX_CANVAS_ZOOM, requestedScale),
+    );
     const worldX = (mouseX - state.offsetX) / state.scale;
     const worldY = (mouseY - state.offsetY) / state.scale;
-    state.offsetX = mouseX - worldX * newScale;
-    state.offsetY = mouseY - worldY * newScale;
-    state.scale = newScale;
+    state.offsetX = mouseX - worldX * nextScale;
+    state.offsetY = mouseY - worldY * nextScale;
+    state.scale = nextScale;
+  }
+
+  function handleGestureStart(event: Event) {
+    event.preventDefault();
+    cancelZoomAnimation();
+    safariGestureStartScale = state.scale;
+  }
+
+  function handleGestureChange(event: Event) {
+    event.preventDefault();
+    const gesture = event as Event & {
+      scale: number;
+      clientX?: number;
+      clientY?: number;
+    };
+    if (safariGestureStartScale === null) safariGestureStartScale = state.scale;
+    const rect = canvas.getBoundingClientRect();
+    const x = Number.isFinite(gesture.clientX)
+      ? gesture.clientX! - rect.left
+      : rect.width / 2;
+    const y = Number.isFinite(gesture.clientY)
+      ? gesture.clientY! - rect.top
+      : rect.height / 2;
+    zoomAtScreenPoint(
+      x,
+      y,
+      safariGestureStartScale * Math.pow(gesture.scale, 6),
+    );
+    scheduleRender();
+  }
+
+  function handleGestureEnd() {
+    safariGestureStartScale = null;
+  }
+
+  function setZoom(zoom: number) {
+    const rect = canvas.getBoundingClientRect();
+    animateZoomAt(zoom, rect.width / 2, rect.height / 2);
+  }
+
+  function zoomBy(factor: number) {
+    const baseScale = zoomAnimationFrame ? zoomAnimationTarget : state.scale;
+    setZoom(baseScale * factor);
+  }
+
+  function setViewportCenter(x: number, y: number) {
+    cancelZoomAnimation();
+    const rect = canvas.getBoundingClientRect();
+    state.offsetX = rect.width / 2 - x * state.scale;
+    state.offsetY = rect.height / 2 - y * state.scale;
     scheduleRender();
   }
 
@@ -2150,8 +2317,33 @@ export default async function initDraw(
 
   function handleCanvasKeydown(event: KeyboardEvent) {
     if (isTypingTarget(event.target) || activeTextCleanup) return;
+    if (event.code === "Space" || event.key.toLowerCase() === "h") {
+      panKeyDown = true;
+      canvas.style.cursor = "grab";
+      event.preventDefault();
+      return;
+    }
     const command = event.metaKey || event.ctrlKey;
     const key = event.key.toLowerCase();
+    if (!command && !event.altKey) {
+      const tools: Record<string, NonNullable<typeof modeRef.current>> = {
+        v: "select",
+        r: "rect",
+        o: "circle",
+        a: "arrow",
+        l: "line",
+        p: "freehand",
+        t: "text",
+        e: "eraser",
+      };
+      const selectedTool = tools[key];
+      if (selectedTool) {
+        window.dispatchEvent(
+          new CustomEvent("canvas:tool-change", { detail: selectedTool }),
+        );
+        return;
+      }
+    }
     if (command && key === "z") {
       event.preventDefault();
       performHistory(event.shiftKey ? "redo" : "undo");
@@ -2167,6 +2359,12 @@ export default async function initDraw(
         event.preventDefault();
         elementClipboard = structuredClone(selectedShapes());
       }
+    } else if (command && key === "x") {
+      if (state.selectedShapeIds.length) {
+        event.preventDefault();
+        elementClipboard = structuredClone(selectedShapes());
+        deleteSelection();
+      }
     } else if (command && key === "v") {
       event.preventDefault();
       pasteSelection();
@@ -2176,6 +2374,15 @@ export default async function initDraw(
     } else if (command && key === "g") {
       event.preventDefault();
       changeGroup(event.shiftKey);
+    } else if (command && (key === "+" || key === "=")) {
+      event.preventDefault();
+      setZoom(state.scale * 1.2);
+    } else if (command && key === "-") {
+      event.preventDefault();
+      setZoom(state.scale / 1.2);
+    } else if (command && key === "0") {
+      event.preventDefault();
+      setZoom(1);
     } else if (event.key === "Delete" || event.key === "Backspace") {
       event.preventDefault();
       deleteSelection();
@@ -2214,6 +2421,19 @@ export default async function initDraw(
     }
   }
 
+  function handleCanvasKeyup(event: KeyboardEvent) {
+    if (event.code === "Space" || event.key.toLowerCase() === "h") {
+      panKeyDown = false;
+      canvas.style.cursor = state.isPanning ? "grabbing" : "";
+    }
+  }
+
+  function handleWindowBlur() {
+    panKeyDown = false;
+    state.isPanning = false;
+    canvas.style.cursor = "";
+  }
+
   function runCanvasCommand(
     command:
       | "undo"
@@ -2238,10 +2458,19 @@ export default async function initDraw(
   window.addEventListener("mousemove", handleMouseMove);
   window.addEventListener("mouseup", handleMouseUp);
   canvas.addEventListener("wheel", handleWheel);
+  canvas.addEventListener("gesturestart", handleGestureStart, {
+    passive: false,
+  });
+  canvas.addEventListener("gesturechange", handleGestureChange, {
+    passive: false,
+  });
+  canvas.addEventListener("gestureend", handleGestureEnd);
   canvas.addEventListener("dblclick", handleDoubleClick);
   const handleWindowResize = () => scheduleRender();
   window.addEventListener("resize", handleWindowResize);
   document.addEventListener("keydown", handleCanvasKeydown);
+  document.addEventListener("keyup", handleCanvasKeyup);
+  window.addEventListener("blur", handleWindowBlur);
 
   // Initial render.
   scheduleRender();
@@ -2253,11 +2482,17 @@ export default async function initDraw(
       window.removeEventListener("mousemove", handleMouseMove);
       window.removeEventListener("mouseup", handleMouseUp);
       canvas.removeEventListener("wheel", handleWheel);
+      canvas.removeEventListener("gesturestart", handleGestureStart);
+      canvas.removeEventListener("gesturechange", handleGestureChange);
+      canvas.removeEventListener("gestureend", handleGestureEnd);
       canvas.removeEventListener("dblclick", handleDoubleClick);
       window.removeEventListener("resize", handleWindowResize);
       document.removeEventListener("keydown", handleCanvasKeydown);
+      document.removeEventListener("keyup", handleCanvasKeyup);
+      window.removeEventListener("blur", handleWindowBlur);
       imageCache.clear();
       if (renderFrame) cancelAnimationFrame(renderFrame);
+      cancelZoomAnimation();
       renderFrame = 0;
       renderRequested = false;
       renderer.dispose();
@@ -2271,6 +2506,9 @@ export default async function initDraw(
     deleteShapeById: deleteShapeById,
     editSelectionStyle,
     runCanvasCommand,
+    setZoom,
+    zoomBy,
+    setViewportCenter,
     clearLocally,
     captureSelectedAreaBlob: captureSelectedAreaBlob,
   };
