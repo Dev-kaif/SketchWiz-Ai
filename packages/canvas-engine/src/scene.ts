@@ -13,6 +13,14 @@ export class Scene {
   private bounds = new Map<string, Bounds>();
   private dirty = true;
   private sorted: CanvasElement[] = [];
+  private compareOrder = (a: CanvasElement, b: CanvasElement) => {
+    const byOrder =
+      (a.order ?? this.insertionOrder.get(a.id)!) -
+      (b.order ?? this.insertionOrder.get(b.id)!);
+    return (
+      byOrder || this.insertionOrder.get(a.id)! - this.insertionOrder.get(b.id)!
+    );
+  };
   get size() {
     return this.elements.size;
   }
@@ -21,11 +29,7 @@ export class Scene {
   }
   all() {
     if (this.dirty) {
-      this.sorted = [...this.elements.values()].sort(
-        (a, b) =>
-          (a.order ?? this.insertionOrder.get(a.id)!) -
-          (b.order ?? this.insertionOrder.get(b.id)!),
-      );
+      this.sorted = [...this.elements.values()].sort(this.compareOrder);
       this.dirty = false;
     }
     return this.sorted;
@@ -67,11 +71,7 @@ export class Scene {
       .search(area)
       .map((entry) => this.elements.get(entry.id)!)
       .filter(Boolean)
-      .sort(
-        (a, b) =>
-          (a.order ?? this.insertionOrder.get(a.id)!) -
-          (b.order ?? this.insertionOrder.get(b.id)!),
-      );
+      .sort(this.compareOrder);
   }
   hit(x: number, y: number, tolerance = 6) {
     return [

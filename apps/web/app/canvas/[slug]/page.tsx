@@ -18,6 +18,7 @@ import {
   X,
   Play,
   TextCursor,
+  Scissors,
 } from "lucide-react";
 import useSocket from "../../../Component/socket/useSocket";
 import axios from "axios";
@@ -646,7 +647,7 @@ const Page = ({ params }: Param) => {
           { name: "freehand", symbol: <Pencil /> },
           { name: "text", symbol: <TypeOutline /> },
           { name: "eraser", symbol: <Eraser /> },
-          { name: "precision-eraser", symbol: <Eraser /> },
+          { name: "precision-eraser", symbol: <Scissors /> },
         ].map((shapeObj) => (
           <button
             key={shapeObj.name}

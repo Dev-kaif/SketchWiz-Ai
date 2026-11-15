@@ -62,6 +62,7 @@ export class CanvasRenderer {
     const overlay = this.overlayCanvas.getContext("2d")!;
     overlay.setTransform(1, 0, 0, 1, 0, 0);
     overlay.clearRect(0, 0, width, height);
+    overlay.setLineDash([]);
     overlay.setTransform(
       dpr * camera.zoom,
       0,
@@ -75,7 +76,7 @@ export class CanvasRenderer {
     overlay.lineWidth = 1 / camera.zoom;
     overlay.strokeStyle = "#00aaff";
     const selected = [...selection]
-      .map((id) => scene.get(id))
+      .map((id) => previews.get(id) ?? scene.get(id))
       .filter((e): e is CanvasElement => !!e);
     const bounds = selectionBounds(selected);
     if (bounds) {
@@ -157,6 +158,7 @@ export class CanvasRenderer {
             e.y2 - l * Math.sin(a + Math.PI / 7),
           );
           ctx.closePath();
+          ctx.fillStyle = e.strokeColor ?? "#fff";
           ctx.fill();
         }
         break;

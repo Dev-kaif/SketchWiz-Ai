@@ -746,8 +746,16 @@ export default async function initDraw(
     );
     ctx.save();
 
-    ctx.translate(state.offsetX, state.offsetY);
-    ctx.scale(state.scale, state.scale);
+    const rect = canvas.getBoundingClientRect();
+    const pixelRatio = canvas.width / Math.max(1, rect.width);
+    ctx.setTransform(
+      pixelRatio * state.scale,
+      0,
+      0,
+      pixelRatio * state.scale,
+      pixelRatio * state.offsetX,
+      pixelRatio * state.offsetY,
+    );
 
     // NEW: Draw marquee selection rectangle
     if (
@@ -1204,10 +1212,17 @@ export default async function initDraw(
   // Prevent default context menu.
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
-  const clientToWorld = (clientX: number, clientY: number) => ({
-    x: (clientX - state.offsetX) / state.scale,
-    y: (clientY - state.offsetY) / state.scale,
-  });
+  const clientToCanvas = (clientX: number, clientY: number) => {
+    const rect = canvas.getBoundingClientRect();
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  };
+  const clientToWorld = (clientX: number, clientY: number) => {
+    const point = clientToCanvas(clientX, clientY);
+    return {
+      x: (point.x - state.offsetX) / state.scale,
+      y: (point.y - state.offsetY) / state.scale,
+    };
+  };
 
   const freehandBuilder = new FreehandBuilder(() => state.scale);
   const drawingInput = new PointerToolLifecycle(
@@ -1289,8 +1304,9 @@ export default async function initDraw(
     // 2. Handle right-click for panning (second highest priority)
     if (e.button === 2) {
       state.isPanning = true;
-      state.panStartX = e.clientX - state.offsetX;
-      state.panStartY = e.clientY - state.offsetY; // FIXED: Corrected this line
+      const point = clientToCanvas(e.clientX, e.clientY);
+      state.panStartX = point.x - state.offsetX;
+      state.panStartY = point.y - state.offsetY;
       state.selectedShapeIds = []; // Clear selection on pan start
       state.isMarqueeSelecting = false; // Ensure marquee is off
       scheduleRender();
@@ -1561,8 +1577,9 @@ export default async function initDraw(
       state.currentX = worldX;
       state.currentY = worldY;
     } else if (state.isPanning) {
-      state.offsetX = e.clientX - state.panStartX;
-      state.offsetY = e.clientY - state.panStartY;
+      const point = clientToCanvas(e.clientX, e.clientY);
+      state.offsetX = point.x - state.panStartX;
+      state.offsetY = point.y - state.panStartY;
     } else if (modeRef.current === "select" && state.isMarqueeSelecting) {
       state.marqueeCurrentX = worldX;
       state.marqueeCurrentY = worldY;
@@ -1666,15 +1683,27 @@ export default async function initDraw(
 
   function eraseAlongPath(trajectory: Point[], precise: boolean) {
     const radius = (strokeWidthRef.current * 5) / state.scale;
+    const origin = trajectory[0]!;
+    const maxDistanceFromStart = Math.max(
+      ...trajectory.map((point) =>
+        Math.hypot(point.x - origin.x, point.y - origin.y),
+      ),
+    );
     const bounds = {
       minX: Math.min(...trajectory.map((p) => p.x)) - radius,
       minY: Math.min(...trajectory.map((p) => p.y)) - radius,
       maxX: Math.max(...trajectory.map((p) => p.x)) + radius,
       maxY: Math.max(...trajectory.map((p) => p.y)) + radius,
     };
-    const candidates = scene
+    const intersecting = scene
       .query(bounds)
       .filter((shape) => sweptIntersects(shape, trajectory, radius));
+    // A click erases only the topmost hit. A drag continues to erase every
+    // object crossed by the swept eraser path.
+    const candidates =
+      maxDistanceFromStart <= Math.max(6 / state.scale, radius * 0.35)
+        ? intersecting.slice(-1)
+        : intersecting;
     const shapeIndexes = new Map(
       state.shapes.map((shape, index) => [shape.id, index]),
     );
@@ -1929,8 +1958,7 @@ export default async function initDraw(
       activeTextCleanup();
     }
 
-    const worldX = (e.clientX - state.offsetX) / state.scale;
-    const worldY = (e.clientY - state.offsetY) / state.scale;
+    const { x: worldX, y: worldY } = clientToWorld(e.clientX, e.clientY);
     state.textPreview = { x: worldX, y: worldY, text: "", showCursor: true };
     scheduleRender();
 
