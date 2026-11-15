@@ -428,15 +428,15 @@ erDiagram
 
 - `Room.adminId` remains the existing owner identifier, preserving existing room ownership and IDs. `RoomMember` adds unique per-room membership and owner/editor/viewer roles; existing owners are inserted as `OWNER` by the additive migration. Newly created rooms create their owner membership and empty canvas in the same database write.
 - `Canvas` is the current canvas record for a room and carries the latest monotonically increasing revision.
-- `CanvasElement` stores each shape's flexible properties as PostgreSQL JSONB. The WebSocket path currently dual-writes supported shape messages to this current-state table while continuing to write the legacy `Chat` row required by the existing frontend.
-- `CanvasOperation` records those writes with a unique operation ID (`chat-<legacy row id>`) and per-canvas revision. The present protocol does not carry client operation IDs, so this compatibility ID prevents replay of the same persisted row but cannot deduplicate repeated client sends.
-- `CanvasSnapshot` is modeled for future recovery. Snapshot creation and operation compaction are not implemented in this batch; adding them before defining the synchronization protocol would create ambiguous recovery rules.
-- `Asset` stores object-storage metadata only (key, MIME type, size and optional checksum). Image bytes are not stored in canvas JSON or PostgreSQL by this schema; object storage integration is future work.
+- `CanvasElement` is the materialized current state. `CanvasOperation` stores durable, ordered changes with client operation IDs; both are updated in one transaction. `CanvasSnapshot` remains available for future compaction, but snapshots and operation pruning are not implemented.
+- New clients use `GET /api/room/:roomId/canvas` for current state and can request missed operations with `afterRevision`. The historical `GET /api/room/:roomId` response remains backed by Chat for compatibility.
+- New WebSocket clients send `canvas:create`, `canvas:update`, `canvas:delete`, or `canvas:batch`. The server commits these before acknowledging or broadcasting them. `canvas:sync` returns missed operations or a state snapshot. `canvas:preview` and `presence:update` are ephemeral. Legacy `chat` messages still write Chat and project supported shapes into canvas state during the compatibility period.
+- Inline image data sent by the existing AI flow is still carried in element JSONB and operation payloads. This can make rows and messages large; moving image bytes to object storage is a follow-up.
 - `Chat` remains the compatibility/history table. No legacy rows are deleted by the new migration or backfill.
 
 #### Persistence and synchronization strategy
 
-The current source of truth for the legacy browser contract remains `Chat`: it returns the persisted JSON shape history to the frontend as before. The new current-state projection is `Canvas` plus `CanvasElement`; the WebSocket service writes both projections atomically, and writes a corresponding `CanvasOperation`. AI and drawing previews are not persisted by this change. Cursor, selection and presence events are not part of the current protocol.
+`CanvasElement` is authoritative for current state and `CanvasOperation` is the ordered recovery log. Chat remains historical data and is written only for legacy `chat` clients; new protocol events do not dual-write it. If no canvas operations exist yet, the state reader can project the most recent 2,000 legacy Chat rows for compatibility. Run and verify the repeatable backfill before relying on complete state for rooms with larger histories. There is no automatic operation compaction yet, so the operation log grows with persistent edits.
 
 Snapshots, compaction, incremental reconnect, and authoritative operation replay are intentionally deferred until the canvas protocol has stable operation IDs and explicit update/delete semantics. This avoids claiming recovery guarantees the existing protocol cannot provide.
 

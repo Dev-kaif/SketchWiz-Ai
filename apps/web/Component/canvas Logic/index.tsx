@@ -195,6 +195,9 @@ export default async function initDraw(
 
   // Consolidate all drawing variables in state.
   const state: DrawState = { ...defaultState };
+  let roomIdForSync: number | null = null;
+  let canvasRevision = 0;
+  let requestedSyncRevision: number | null = null;
 
   // Schedule rendering with requestAnimationFrame.
   let renderRequested = false;
@@ -345,6 +348,14 @@ export default async function initDraw(
         (selectedId) => selectedId !== id
       );
       scheduleRender();
+      if (roomIdForSync !== null && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          type: "canvas:delete",
+          roomId: roomIdForSync,
+          operationId: crypto.randomUUID(),
+          elementId: id,
+        }));
+      }
     }
   }
 
@@ -761,45 +772,115 @@ function captureSelectedAreaBlob(): Promise<Blob | null> {
   // --------------------------------------------------
   // Load Previous Shapes and Setup Socket
   // --------------------------------------------------
+  function upsertShape(shape: Shape) {
+    const index = state.shapes.findIndex((current) => current.id === shape.id);
+    if (index === -1) state.shapes.push(shape);
+    else state.shapes[index] = shape;
+  }
+
+  function requestCanvasSync() {
+    if (roomIdForSync === null || socket.readyState !== WebSocket.OPEN) return;
+    if (requestedSyncRevision === canvasRevision) return;
+    requestedSyncRevision = canvasRevision;
+    socket.send(JSON.stringify({
+      type: "canvas:sync",
+      roomId: roomIdForSync,
+      afterRevision: canvasRevision,
+    }));
+  }
+
+  function applyRevisionedOperation(operation: any) {
+    const revision = Number(operation.revision);
+    if (!Number.isSafeInteger(revision) || revision <= canvasRevision) return;
+    if (revision !== canvasRevision + 1) {
+      requestCanvasSync();
+      return;
+    }
+    const type = operation.type ?? operation.kind;
+    const payload = operation.payload;
+    if (type === "canvas:clear" || type === "clear") {
+      state.shapes = [];
+    } else if (["canvas:delete", "canvas:delete_element", "delete_element"].includes(type)) {
+      const id = operation.elementId ?? payload?.id;
+      if (typeof id === "string")
+        state.shapes = state.shapes.filter((shape) => shape.id !== id);
+    } else {
+      const element = operation.element ?? payload?.element ?? payload;
+      if (element && typeof element.id === "string" && typeof element.type === "string")
+        upsertShape(element as Shape);
+    }
+    canvasRevision = revision;
+    scheduleRender();
+  }
+
+  function applyServerMessage(data: any) {
+    if (data.type === "canvas:ack") {
+      // The acknowledgement confirms durability, but another client's operation
+      // may precede this revision. Recover from our last applied revision.
+      requestCanvasSync();
+      return;
+    }
+    if (data.type === "canvas:sync" && data.mode) {
+      requestedSyncRevision = null;
+      if (data.mode === "snapshot") {
+        state.shapes = Array.isArray(data.elements) ? data.elements as Shape[] : [];
+        canvasRevision = Number(data.revision) || 0;
+        scheduleRender();
+      } else if (data.mode === "operations" && Array.isArray(data.operations)) {
+        data.operations.forEach(applyRevisionedOperation);
+      }
+      if (data.hasMore) requestCanvasSync();
+      return;
+    }
+    if (data.type === "canvas:batch" && Array.isArray(data.operations)) {
+      data.operations.forEach((operation: any) => applyRevisionedOperation({
+        ...operation,
+        type: `canvas:${operation.kind}`,
+      }));
+      return;
+    }
+    if (["canvas:create", "canvas:update", "canvas:delete", "canvas:create_element", "canvas:update_element", "canvas:delete_element"].includes(data.type)) {
+      applyRevisionedOperation(data);
+      return;
+    }
+    if (data.type === "chat" && data.message) {
+      upsertShape(data.message as Shape);
+      scheduleRender();
+    }
+    if (data.type === "ai") setAiResponse(data.message);
+  }
+
+  socket.onmessage = (event) => {
+    try {
+      applyServerMessage(JSON.parse(event.data));
+    } catch {
+      // Ignore malformed server frames without interrupting canvas input.
+    }
+  };
+
   async function loadPreviousShapes() {
     const slug = (await params).slug;
     const roomIdRes = await axios.get(`${BACKEND_URL}/api/room/slug/${slug}`);
     const roomId = roomIdRes.data.room.id;
-    // Join the room via socket.
+    roomIdForSync = roomId;
+    const res = await axios.get(`${BACKEND_URL}/api/room/${roomId}/canvas`);
+    state.shapes = Array.isArray(res.data.elements) ? res.data.elements as Shape[] : [];
+    canvasRevision = Number(res.data.revision) || 0;
+    scheduleRender();
     socket.send(JSON.stringify({ type: "join_room", roomId }));
-    const res = await axios.get(`${BACKEND_URL}/api/room/${roomId}`);
-    const messages = res.data.messages;
-    messages.forEach((msg: { id: number; message: string }) => {
-      // ADDED: Assert message is a Shape for type safety
-      state.shapes.push(JSON.parse(msg.message) as Shape);
-    });
+    requestCanvasSync();
     return roomId;
   }
 
   const roomId = await loadPreviousShapes();
 
-
-  socket.onmessage = (e) => {
-    const data = JSON.parse(e.data);
-  
-    if (data.type === "chat" && data.message) {
-      const shape = data.message as Shape;
-  
-      if (shape.type === "image" && shape.src.startsWith("data:image")) {
-        state.shapes.push(shape);
-      }
-  
-      state.shapes.push(shape);
-      scheduleRender();
-    }
-  
-    if (data.type === "ai") {
-      setAiResponse(data.message);
-    }
-  };
-
   function sendShapeMessage(shape: Shape) {
-    const message = { type: "chat", roomId, message: shape };
+    const message = {
+      type: "canvas:create",
+      roomId,
+      operationId: crypto.randomUUID(),
+      element: shape,
+    };
     socket.send(JSON.stringify(message));
   }
 

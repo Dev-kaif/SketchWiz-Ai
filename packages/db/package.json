@@ -24,7 +24,8 @@
   },
   "exports": {
     "./client": "./dist/index.js",
-    "./access": "./dist/index.js"
+    "./access": "./dist/index.js",
+    "./canvas": "./dist/canvas.js"
   },
   "keywords": [],
   "author": "",

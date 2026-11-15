@@ -1,6 +1,8 @@
 import { Router, type Router as ExpressRouter } from "express";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { client, joinPublicRoom, roomRoleForUser } from "@repo/db/access";
+import { getCanvasSync } from "@repo/db/canvas";
 import { RoomSchema } from "@repo/common/schemas";
 import { auth } from "../../middleware/auth.js";
 import { AppError } from "../../errors.js";
@@ -112,32 +114,57 @@ router.get("/room/:roomId", async (req, res, next) => {
   }
 });
 
+router.get("/room/:roomId/canvas", async (req, res, next) => {
+  try {
+    const roomId = roomIdFrom(req.params.roomId);
+    await requireRole(roomId, req.user!.id, ["OWNER", "EDITOR", "VIEWER"]);
+    const rawRevision = req.query.afterRevision;
+    let afterRevision: number | undefined;
+    if (rawRevision !== undefined) {
+      if (typeof rawRevision !== "string" || !/^\d+$/.test(rawRevision))
+        throw new AppError(400, "Invalid canvas revision", "INVALID_REVISION");
+      afterRevision = Number(rawRevision);
+      if (!Number.isSafeInteger(afterRevision))
+        throw new AppError(400, "Invalid canvas revision", "INVALID_REVISION");
+    }
+    const canvas = await getCanvasSync(roomId, afterRevision);
+    if (!canvas) throw new AppError(404, "Canvas not found", "CANVAS_NOT_FOUND");
+    res.json(canvas);
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.delete("/room/delete/content/:roomId", async (req, res, next) => {
   try {
     const roomId = roomIdFrom(req.params.roomId);
     await requireRole(roomId, req.user!.id, ["OWNER"]);
-    const canvas = await client.canvas.findUnique({
-      where: { roomId },
-      select: { id: true },
+    const response = await client.$transaction(async (tx) => {
+      const [canvas] = await tx.$queryRaw<Array<{ id: number }>>`
+        SELECT "id" FROM "Canvas" WHERE "roomId" = ${roomId} FOR UPDATE
+      `;
+      const deletedChat = await tx.chat.deleteMany({ where: { roomId } });
+      if (canvas) {
+        await tx.canvasElement.deleteMany({ where: { canvasId: canvas.id } });
+        await tx.canvasSnapshot.deleteMany({ where: { canvasId: canvas.id } });
+        const updated = await tx.canvas.update({
+          where: { id: canvas.id },
+          data: { revision: { increment: 1 } },
+          select: { revision: true },
+        });
+        await tx.canvasOperation.create({
+          data: {
+            operationId: `clear-${randomUUID()}`,
+            canvasId: canvas.id,
+            revision: updated.revision,
+            actorId: req.user!.id,
+            kind: "clear",
+            payload: {},
+          },
+        });
+      }
+      return deletedChat;
     });
-    const [response] = await client.$transaction([
-      client.chat.deleteMany({ where: { roomId } }),
-      ...(canvas
-        ? [
-            client.canvasElement.deleteMany({ where: { canvasId: canvas.id } }),
-            client.canvasOperation.deleteMany({
-              where: { canvasId: canvas.id },
-            }),
-            client.canvasSnapshot.deleteMany({
-              where: { canvasId: canvas.id },
-            }),
-            client.canvas.update({
-              where: { id: canvas.id },
-              data: { revision: { increment: 1 } },
-            }),
-          ]
-        : []),
-    ]);
     res.json({ message: "Content deleted successfully.", response });
   } catch (error) {
     next(error);

@@ -243,9 +243,12 @@ const Page = ({ params }: Param) => {
 
         // Send over socket
         if (socket && roomId) {
-          socket.send(
-            JSON.stringify({ type: "chat", roomId, message: newImageShape })
-          );
+          socket.send(JSON.stringify({
+            type: "canvas:create",
+            roomId,
+            operationId: crypto.randomUUID(),
+            element: newImageShape,
+          }));
         } else {
           console.warn("Socket or Room ID not available.");
         }

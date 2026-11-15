@@ -128,6 +128,7 @@ export function createWebSocketServer(
       queuedBytes: 0,
       processing: false,
       closingForBackpressure: false,
+      lastEphemeralAt: new Map(),
     };
     alive.set(socket, true);
     socket.on("pong", () => alive.set(socket, true));

@@ -13,6 +13,7 @@ export type Connection = {
   closingForBackpressure: boolean;
   closeCode?: number;
   closeReason?: string;
+  lastEphemeralAt: Map<number, number>;
 };
 export class RoomMembership {
   private members = new Map<number, Set<Connection>>();
@@ -28,6 +29,7 @@ export class RoomMembership {
   leave(connection: Connection, roomId: number) {
     connection.rooms.delete(roomId);
     connection.roles.delete(roomId);
+    connection.lastEphemeralAt.delete(roomId);
     const group = this.members.get(roomId);
     group?.delete(connection);
     if (group?.size === 0) this.members.delete(roomId);
