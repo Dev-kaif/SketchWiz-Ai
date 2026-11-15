@@ -488,7 +488,7 @@ Your effectiveness is measured solely by the clarity, accuracy, and level of det
   `;
 
   const response = await ai.models.generateContent({
-    model: "gemini-3.8-flash",
+    model: "gemini-3.1-flash-image",
     config: {
       systemInstruction: system_prompt,
     },
